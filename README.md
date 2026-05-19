@@ -13,3 +13,12 @@ simple hello word publisher/listener : https://docs.ros.org/en/kilted/Tutorials/
 
 webot first example : https://docs.ros.org/en/kilted/Tutorials/Advanced/Simulators/Webots/Setting-Up-Simulation-Webots-Basic.html  
 
+
+To try the first example, go in the root folder and do : 
+```bash
+colcon build
+source install/local_setup.bash
+ros2 launch pair robot_launch.py
+```
+
+
