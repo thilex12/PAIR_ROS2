@@ -25,6 +25,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'cbba_agent = pair.cbba_agent:main'
         ],
     },
 )
