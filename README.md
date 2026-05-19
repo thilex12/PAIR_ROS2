@@ -6,3 +6,10 @@ Ans then : https://docs.ros.org/en/kilted/Tutorials/Advanced/Simulators/Webots/I
 (you can add source /opt/ros/kilted/setup.bash to your bashrc)
 
 Then to install the workspace : https://docs.ros.org/en/kilted/Tutorials/Beginner-Client-Libraries/Creating-A-Workspace/Creating-A-Workspace.html  
+
+Then create your first package : https://docs.ros.org/en/kilted/Tutorials/Beginner-Client-Libraries/Creating-Your-First-ROS2-Package.html
+
+simple hello word publisher/listener : https://docs.ros.org/en/kilted/Tutorials/Beginner-Client-Libraries/Writing-A-Simple-Py-Publisher-And-Subscriber.html  
+
+webot first example : https://docs.ros.org/en/kilted/Tutorials/Advanced/Simulators/Webots/Setting-Up-Simulation-Webots-Basic.html  
+
