@@ -21,7 +21,6 @@ class CbbaAgent:
 
         self.__target_twist = Twist()
 
-        # Init rclpy si pas encore fait
         if not rclpy.ok():
             rclpy.init(args=None)
 
