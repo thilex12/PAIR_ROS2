@@ -138,6 +138,15 @@ class CbbaAgent(Node):
             return
 
         self.__merge_peer_winners()
+        self.__merge_peer_completions()
+
+        if self.__all_tasks_completed():
+            self.__bundle.clear()
+            self.__publish_idle_state()
+            self.__publish_state()
+            self.__publish_assignment_summary()
+            return
+
         self.__rebuild_bundle()
         self.__publish_command()
         self.__publish_state()
@@ -157,6 +166,32 @@ class CbbaAgent(Node):
                     if local_entry is not None and local_entry.robot == self.__robot_name and task_id in self.__bundle:
                         self.__abandon_from_task(task_id, peer_entry)
                     self.__winner_table[task_id] = peer_entry
+
+    def __merge_peer_completions(self) -> None:
+        peer_completed_tasks: set[str] = set()
+
+        for peer_state in self.__peer_state.values():
+            peer_completed_tasks.update(str(task_id) for task_id in peer_state.get('completed_tasks', []))
+
+        for task_id in peer_completed_tasks:
+            if task_id in self.__completed_tasks:
+                continue
+
+            self.__completed_tasks.add(task_id)
+            self.__abandoned_tasks.discard(task_id)
+            self.__winner_table.pop(task_id, None)
+            if task_id in self.__bundle:
+                self.__bundle.remove(task_id)
+
+    def __all_tasks_completed(self) -> bool:
+        if not self.__tasks:
+            return True
+
+        completed_task_ids = set(self.__completed_tasks)
+        for peer_state in self.__peer_state.values():
+            completed_task_ids.update(str(task_id) for task_id in peer_state.get('completed_tasks', []))
+
+        return all(task.task_id in completed_task_ids for task in self.__tasks)
 
     def __abandon_from_task(self, task_id: str, winning_peer: WinnerEntry | None = None) -> None:
         if task_id not in self.__bundle:
