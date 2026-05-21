@@ -1,8 +1,50 @@
 # pair/pair/generate_world.py
 import math
+import os
 
-def generate_world(num_robots=2, output_file='worlds/my_world.wbt'):
-    """Generate a Webots world file with num_robots robots."""
+
+def load_config(config_file):
+    """Parse robot_count and waypoints from YAML manually (no PyYAML dependency)."""
+    robot_count = 2
+    waypoints = []
+
+    if not os.path.exists(config_file):
+        return robot_count, waypoints
+
+    with open(config_file, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+
+    in_waypoints = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+
+        if stripped == 'waypoints:':
+            in_waypoints = True
+            continue
+
+        if in_waypoints:
+            if stripped.startswith('- ['):
+                inner = stripped[3:-1]  # strip "- [" and "]"
+                x, y = [float(v.strip()) for v in inner.split(',')]
+                waypoints.append((x, y))
+            elif not stripped.startswith('-'):
+                in_waypoints = False
+
+        if ':' in stripped and not in_waypoints:
+            key, value = stripped.split(':', 1)
+            if key.strip() == 'robot_count':
+                robot_count = int(value.strip())
+
+    return robot_count, waypoints
+
+
+def generate_world(num_robots=2, waypoints=None, output_file='worlds/my_world.wbt'):
+    """Generate a Webots world file with num_robots robots and waypoint markers."""
+
+    if waypoints is None:
+        waypoints = []
 
     world_header = """#VRML_SIM R2022b utf8
 
@@ -50,15 +92,35 @@ CircleArena {
 
     world_content = world_header
 
-    # CircleArena default radius is 1.0m, keep robots at 0.7m to stay inside
+    # ── Waypoint markers ──────────────────────────────────────────────────────
+    for j, (wx, wy) in enumerate(waypoints):
+        world_content += f"""Solid {{
+  translation {wx} {wy} 0.005
+  children [
+    Shape {{
+      appearance PBRAppearance {{
+        baseColor 1 1 0
+        roughness 0.5
+        metalness 0
+        emissiveColor 1 1 0
+      }}
+      geometry Cylinder {{
+        height 0.01
+        radius 0.03
+      }}
+    }}
+  ]
+  name "waypoint_{j}"
+}}
+"""
+
+    # ── Robots ────────────────────────────────────────────────────────────────
     spawn_radius = 0.7
 
     for i in range(num_robots):
-        # Distribute evenly on a circle
         angle = 2 * math.pi * i / num_robots
         x = spawn_radius * math.cos(angle)
         y = spawn_radius * math.sin(angle)
-        # Face toward center
         rotation_z = angle + math.pi
 
         color = colors[i % len(colors)]
@@ -67,6 +129,12 @@ CircleArena {
   translation {x:.4f} {y:.4f} 0
   rotation 0 0 1 {rotation_z:.4f}
   children [
+    GPS {{
+      name "gps"
+    }}
+    Compass {{
+      name "compass"
+    }}
     HingeJoint {{
       jointParameters HingeJointParameters {{
         axis 0 1 0
