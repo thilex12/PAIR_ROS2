@@ -134,3 +134,13 @@ Tasks are received as a JSON array of objects. A minimal task looks like this:
 ```
 
 The node publishes local bids and allocations as JSON objects on the configured topics.
+
+Build et sourcing
+```bash
+colcon build --packages-select my_package --symlink-install && source install/local_setup.bash
+```
+
+Lancement
+```bash
+ros2 launch my_package cbba_launch.py
+```
