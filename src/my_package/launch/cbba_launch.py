@@ -36,7 +36,7 @@ CircleArena {
 '''
 WORLD_FOOTER = '''
 '''
-TASK_MARKER_TEMPLATE = Template('''Pose {
+TASK_MARKER_TEMPLATE = Template('''DEF TASK_$task_name Transform {
     translation $x $y 0.01
     children [
         Shape {
@@ -51,7 +51,6 @@ TASK_MARKER_TEMPLATE = Template('''Pose {
             }
         }
     ]
-    name "$task_name"
 }
 ''')
 ROBOT_TEMPLATE = Template('''Robot {
@@ -240,7 +239,8 @@ def _load_task_markers(tasks_config_path):
     ]
 
     for index, task_data in enumerate(configuration.get('tasks', [])):
-        red, green, blue = palette[index % len(palette)]
+        # default marker color: red (not done)
+        red, green, blue = (0.85, 0.15, 0.15)
         task_markers.append(
             TASK_MARKER_TEMPLATE.substitute(
                 task_name=str(task_data.get('id', f'task_{index + 1}')),

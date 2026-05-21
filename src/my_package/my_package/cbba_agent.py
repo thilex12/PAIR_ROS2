@@ -1,10 +1,12 @@
 import json
+import heapq
 import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import rclpy
+import time
 from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import Twist
 from rclpy.node import Node
@@ -19,6 +21,22 @@ class Task:
     x: float
     y: float
     reward: float
+
+
+@dataclass(frozen=True)
+class StaticObstacle:
+    x: float
+    y: float
+    radius: float
+
+
+@dataclass(frozen=True)
+class WallSegment:
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    thickness: float
 
 
 @dataclass
@@ -39,6 +57,7 @@ class CbbaAgent(Node):
     def __init__(self) -> None:
         super().__init__('cbba_agent')
 
+        # parameters
         self.declare_parameter('robot_name', '')
         self.declare_parameter('tasks_config', '')
         self.declare_parameter('bundle_size', 2)
@@ -48,6 +67,12 @@ class CbbaAgent(Node):
         self.declare_parameter('linear_gain', 0.9)
         self.declare_parameter('angular_gain', 2.5)
         self.declare_parameter('clearance_threshold', 0.09)
+        self.declare_parameter('path_resolution', 0.05)
+        self.declare_parameter('arena_radius', 0.75)
+        self.declare_parameter('robot_avoidance_radius', 0.12)
+        self.declare_parameter('obstacles_config', '')
+        self.declare_parameter('path_publish_interval', 0.6)
+        self.declare_parameter('max_path_points', 50)
 
         self.__robot_name = self.get_parameter('robot_name').get_parameter_value().string_value
         if not self.__robot_name:
@@ -61,8 +86,19 @@ class CbbaAgent(Node):
         self.__linear_gain = self.get_parameter('linear_gain').get_parameter_value().double_value
         self.__angular_gain = self.get_parameter('angular_gain').get_parameter_value().double_value
         self.__clearance_threshold = self.get_parameter('clearance_threshold').get_parameter_value().double_value
+        self.__path_resolution = self.get_parameter('path_resolution').get_parameter_value().double_value
+        self.__arena_radius = self.get_parameter('arena_radius').get_parameter_value().double_value
+        self.__robot_avoidance_radius = self.get_parameter('robot_avoidance_radius').get_parameter_value().double_value
+        self.__path_publish_interval = max(0.0, self.get_parameter('path_publish_interval').get_parameter_value().double_value)
+        self.__max_path_points = max(1, self.get_parameter('max_path_points').get_parameter_value().integer_value)
+
+        self.__last_path_pub_time = 0.0
+        self.__last_published_path: list[tuple[float, float]] | None = None
 
         self.__tasks = self.__load_tasks(tasks_config)
+        obstacles_config = self.get_parameter('obstacles_config').get_parameter_value().string_value
+        self.__static_obstacles, self.__walls = self.__load_static_obstacles(obstacles_config)
+
         self.__pose: tuple[float, float, float] | None = None
         self.__left_range = float('inf')
         self.__right_range = float('inf')
@@ -72,14 +108,17 @@ class CbbaAgent(Node):
         self.__winner_table: dict[str, WinnerEntry] = {}
         self.__peer_state: dict[str, dict[str, Any]] = {}
 
+        # subscriptions
         self.create_subscription(PoseStamped, 'pose', self.__pose_callback, 1)
         self.create_subscription(Range, 'left_sensor', self.__left_sensor_callback, 1)
         self.create_subscription(Range, 'right_sensor', self.__right_sensor_callback, 1)
         self.create_subscription(String, '/cbba/state', self.__state_callback, 10)
 
+        # publishers
         self.__cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 1)
         self.__state_publisher = self.create_publisher(String, '/cbba/state', 10)
         self.__assignment_publisher = self.create_publisher(String, '/cbba/assignment', 10)
+        self.__path_publisher = self.create_publisher(String, 'cbba_path', 10)
 
         self.create_timer(0.2, self.__timer_callback)
 
@@ -107,6 +146,42 @@ class CbbaAgent(Node):
             )
 
         return tasks
+
+    def __load_static_obstacles(self, obstacles_config: str) -> tuple[list[StaticObstacle], list[WallSegment]]:
+        if not obstacles_config:
+            return [], []
+
+        config_path = Path(obstacles_config)
+        if not config_path.is_file():
+            self.get_logger().warning(f'Obstacles config not found: {obstacles_config}')
+            return [], []
+
+        with config_path.open('r', encoding='utf-8') as obstacles_file:
+            configuration = yaml.safe_load(obstacles_file) or {}
+
+        obstacles: list[StaticObstacle] = []
+        for obstacle_data in configuration.get('static_obstacles', []):
+            obstacles.append(
+                StaticObstacle(
+                    x=float(obstacle_data['x']),
+                    y=float(obstacle_data['y']),
+                    radius=float(obstacle_data.get('radius', 0.08)),
+                )
+            )
+
+        walls: list[WallSegment] = []
+        for wall_data in configuration.get('walls', []):
+            walls.append(
+                WallSegment(
+                    x1=float(wall_data['x1']),
+                    y1=float(wall_data['y1']),
+                    x2=float(wall_data['x2']),
+                    y2=float(wall_data['y2']),
+                    thickness=float(wall_data.get('thickness', 0.04)),
+                )
+            )
+
+        return obstacles, walls
 
     def __pose_callback(self, message: PoseStamped) -> None:
         quaternion_z = message.pose.orientation.z
@@ -223,6 +298,106 @@ class CbbaAgent(Node):
 
         return candidate.robot < incumbent.robot
 
+    # -- A* utilities -------------------------------------------------
+    def __world_to_cell(self, x: float, y: float) -> tuple[int, int]:
+        return (int(round(x / self.__path_resolution)), int(round(y / self.__path_resolution)))
+
+    def __cell_to_world(self, cx: int, cy: int) -> tuple[float, float]:
+        return (cx * self.__path_resolution, cy * self.__path_resolution)
+
+    def __distance_to_segment(self, px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> float:
+        dx = x2 - x1
+        dy = y2 - y1
+        if dx == 0 and dy == 0:
+            return _distance(px, py, x1, y1)
+        t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)
+        t = max(0.0, min(1.0, t))
+        qx = x1 + t * dx
+        qy = y1 + t * dy
+        return _distance(px, py, qx, qy)
+
+    def __cell_is_blocked(self, cx: int, cy: int, start_cell: tuple[int, int], goal_cell: tuple[int, int]) -> bool:
+        if (cx, cy) == start_cell or (cx, cy) == goal_cell:
+            return False
+
+        wx, wy = self.__cell_to_world(cx, cy)
+        # outside arena
+        if math.hypot(wx, wy) > self.__arena_radius:
+            return True
+
+        # static circular obstacles
+        for obs in self.__static_obstacles:
+            if _distance(wx, wy, obs.x, obs.y) <= obs.radius + self.__path_resolution * 0.5:
+                return True
+
+        # walls
+        for w in self.__walls:
+            if self.__distance_to_segment(wx, wy, w.x1, w.y1, w.x2, w.y2) <= (w.thickness / 2.0) + self.__path_resolution * 0.5:
+                return True
+
+        # dynamic robots
+        for peer_state in self.__peer_state.values():
+            pose = peer_state.get('pose', {})
+            try:
+                px = float(pose.get('x'))
+                py = float(pose.get('y'))
+            except Exception:
+                continue
+            if _distance(wx, wy, px, py) <= self.__robot_avoidance_radius:
+                return True
+
+        return False
+
+    def __astar_path(self, sx: float, sy: float, gx: float, gy: float) -> list[tuple[float, float]]:
+        start = self.__world_to_cell(sx, sy)
+        goal = self.__world_to_cell(gx, gy)
+        if start == goal:
+            return [(gx, gy)]
+
+        open_heap: list[tuple[float, int, int]] = []
+        heapq.heappush(open_heap, (0.0, start[0], start[1]))
+        came_from: dict[tuple[int, int], tuple[int, int]] = {}
+        gscore: dict[tuple[int, int], float] = {start: 0.0}
+        closed: set[tuple[int, int]] = set()
+
+        neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
+
+        while open_heap:
+            _, cx, cy = heapq.heappop(open_heap)
+            current = (cx, cy)
+            if current in closed:
+                continue
+            if current == goal:
+                # reconstruct
+                path_cells = []
+                cur = current
+                while cur != start:
+                    path_cells.append(cur)
+                    cur = came_from[cur]
+                path_cells.reverse()
+                path = [self.__cell_to_world(px, py) for px, py in path_cells]
+                # ensure final precise goal appended
+                if not path or _distance(path[-1][0], path[-1][1], gx, gy) > self.__path_resolution * 0.6:
+                    path.append((gx, gy))
+                return path
+
+            closed.add(current)
+            for dx, dy in neighbors:
+                nx, ny = cx + dx, cy + dy
+                neighbor = (nx, ny)
+                if self.__cell_is_blocked(nx, ny, start, goal):
+                    continue
+                tentative_g = gscore.get(current, float('inf')) + (math.sqrt(2) if dx != 0 and dy != 0 else 1.0)
+                if tentative_g < gscore.get(neighbor, float('inf')):
+                    came_from[neighbor] = current
+                    gscore[neighbor] = tentative_g
+                    heuristic = math.hypot(goal[0] - nx, goal[1] - ny)
+                    heapq.heappush(open_heap, (tentative_g + heuristic, nx, ny))
+
+        # failed: return straight line fallback
+        return [(gx, gy)]
+
+    # -- CBBA core ----------------------------------------------------
     def __rebuild_bundle(self) -> None:
         for task_id in list(self.__bundle):
             winner = self.__winner_table.get(task_id)
@@ -299,10 +474,7 @@ class CbbaAgent(Node):
         self.__state_publisher.publish(message)
 
     def __publish_assignment_summary(self) -> None:
-        assigned_tasks = {
-            task_id: winner.robot
-            for task_id, winner in self.__winner_table.items()
-        }
+        assigned_tasks = {task_id: winner.robot for task_id, winner in self.__winner_table.items()}
 
         payload = {
             'robot_name': self.__robot_name,
@@ -338,10 +510,43 @@ class CbbaAgent(Node):
             self.__cmd_vel_publisher.publish(command_message)
             return
 
-        heading = math.atan2(target_task.y - current_y, target_task.x - current_x)
+        # compute path and publish it for visualization (throttled + trimmed)
+        path = self.__astar_path(current_x, current_y, target_task.x, target_task.y)
+        # trim or downsample long paths
+        if len(path) > self.__max_path_points:
+            # simple downsample: take evenly spaced samples including last
+            step = max(1, len(path) // self.__max_path_points)
+            trimmed = [path[i] for i in range(0, len(path), step)][:self.__max_path_points]
+            if trimmed[-1] != path[-1]:
+                trimmed[-1] = path[-1]
+            path_to_publish = trimmed
+        else:
+            path_to_publish = path
+
+        now = time.time()
+        try:
+            should_publish = False
+            if now - self.__last_path_pub_time >= self.__path_publish_interval:
+                if self.__last_published_path != path_to_publish:
+                    should_publish = True
+
+            if should_publish:
+                payload = {'robot_name': self.__robot_name, 'task_id': target_task.task_id, 'path': [[float(x), float(y)] for x, y in path_to_publish]}
+                msg = String()
+                msg.data = json.dumps(payload)
+                self.__path_publisher.publish(msg)
+                self.__last_path_pub_time = now
+                self.__last_published_path = list(path_to_publish)
+        except Exception:
+            pass
+
+        # follow first path waypoint
+        nav_x, nav_y = path[0] if path else (target_task.x, target_task.y)
+        heading = math.atan2(nav_y - current_y, nav_x - current_x)
         heading_error = _normalize_angle(heading - current_yaw)
 
-        linear_speed = min(self.__max_linear_speed, self.__linear_gain * distance)
+        nav_distance = _distance(current_x, current_y, nav_x, nav_y)
+        linear_speed = min(self.__max_linear_speed, self.__linear_gain * nav_distance)
         linear_speed *= max(0.0, 1.0 - abs(heading_error) / math.pi)
         angular_speed = max(-self.__max_angular_speed, min(self.__max_angular_speed, self.__angular_gain * heading_error))
 
@@ -358,9 +563,16 @@ class CbbaAgent(Node):
 def main(args: list[str] | None = None) -> None:
     rclpy.init(args=args)
     node = CbbaAgent()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
