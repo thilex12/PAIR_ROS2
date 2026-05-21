@@ -20,18 +20,18 @@ tasks:
     x: 0.45
     y: -0.2
     reward: 8.5
-  - id: discover_border
-    x: 0.0
-    y: 0.68
-    reward: 10.0
+  # - id: discover_border
+  #   x: 0.0
+  #   y: 0.68
+  #   reward: 10.0
   - id: discover_border_east
     x: 0.68
     y: 0.0
     reward: 10.0
-  - id: discover_border_south
-    x: 0.0
-    y: -0.68
-    reward: 10.0
+  # - id: discover_border_south
+  #   x: 0.0
+  #   y: -0.68
+  #   reward: 10.0
   - id: discover_border_west
     x: -0.68
     y: 0.0

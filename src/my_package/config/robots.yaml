@@ -1,4 +1,12 @@
-robot_count: 5
+robot_count: 2
+arena_radius: 2.0
+arena_walls:
+  - x: 0.0
+    y: 0.0
+    width: 0.04
+    depth: 1.4
+    height: 0.16
+    color: [0.5, 0.5, 0.5]
 
 # When false, CBBA agents do not publish paths and nothing is drawn in Webots.
 display_paths: false

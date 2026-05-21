@@ -10,6 +10,7 @@ import time
 from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import Twist
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from sensor_msgs.msg import Range
 from std_msgs.msg import String
 import yaml
@@ -68,7 +69,7 @@ class CbbaAgent(Node):
         self.declare_parameter('angular_gain', 2.5)
         self.declare_parameter('clearance_threshold', 0.09)
         self.declare_parameter('path_resolution', 0.05)
-        self.declare_parameter('arena_radius', 0.75)
+        self.declare_parameter('arena_radius')
         self.declare_parameter('robot_avoidance_radius', 0.12)
         self.declare_parameter('obstacles_config', '')
         self.declare_parameter('path_publish_interval', 0.6)
@@ -88,7 +89,12 @@ class CbbaAgent(Node):
         self.__angular_gain = self.get_parameter('angular_gain').get_parameter_value().double_value
         self.__clearance_threshold = self.get_parameter('clearance_threshold').get_parameter_value().double_value
         self.__path_resolution = self.get_parameter('path_resolution').get_parameter_value().double_value
-        self.__arena_radius = self.get_parameter('arena_radius').get_parameter_value().double_value
+        arena_radius_param = self.get_parameter('arena_radius').get_parameter_value()
+        self.__arena_radius = (
+            arena_radius_param.double_value
+            if arena_radius_param.type == Parameter.Type.DOUBLE
+            else 0.75
+        )
         self.__robot_avoidance_radius = self.get_parameter('robot_avoidance_radius').get_parameter_value().double_value
         self.__path_publish_interval = max(0.0, self.get_parameter('path_publish_interval').get_parameter_value().double_value)
         self.__max_path_points = max(1, self.get_parameter('max_path_points').get_parameter_value().integer_value)

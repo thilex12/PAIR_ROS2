@@ -14,7 +14,7 @@ from webots_ros2_driver.webots_controller import WebotsController
 
 
 ROBOT_NAME_PREFIX = 'auto_robot_'
-WORLD_HEADER = '''#VRML_SIM R2022b utf8
+WORLD_HEADER_TEMPLATE = Template('''#VRML_SIM R2022b utf8
 
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2022b/projects/objects/backgrounds/protos/TexturedBackground.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2022b/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
@@ -32,10 +32,33 @@ TexturedBackground {
 TexturedBackgroundLight {
 }
 CircleArena {
+    radius $arena_radius
 }
-'''
+''')
 WORLD_FOOTER = '''
 '''
+WALL_TEMPLATE = Template('''Solid {
+    translation $x $y $z
+    children [
+        Shape {
+            appearance PBRAppearance {
+                baseColor $red $green $blue
+                roughness 1
+                metalness 0
+            }
+            geometry Box {
+                size $width $depth $height
+            }
+        }
+    ]
+    boundingObject Box {
+        size $width $depth $height
+    }
+    physics Physics {
+    }
+    static TRUE
+}
+''')
 TASK_MARKER_TEMPLATE = Template('''DEF TASK_$task_name Transform {
     translation $x $y 0.01
     children [
@@ -203,11 +226,16 @@ def _load_robot_configuration(package_dir):
     with open(config_path, 'r', encoding='utf-8') as config_file:
         configuration = yaml.safe_load(config_file) or {}
 
+    arena_radius = float(configuration.get('arena_radius', 0.75))
+    arena_radius = max(0.25, min(arena_radius, 2.0))
+
     return {
         'robot_count': max(1, int(configuration.get('robot_count', 1))),
         'display_paths': bool(configuration.get('display_paths', False)),
         'max_linear_speed': float(configuration.get('max_linear_speed', 0.12)),
         'max_angular_speed': float(configuration.get('max_angular_speed', 2.0)),
+        'arena_radius': arena_radius,
+        'arena_walls': configuration.get('arena_walls', []),
     }
 
 
@@ -215,14 +243,14 @@ def _build_robot_names(robot_count):
     return [f'{ROBOT_NAME_PREFIX}{index + 1}' for index in range(robot_count)]
 
 
-def _build_robot_pose(index, robot_count):
+def _build_robot_pose(index, robot_count, arena_radius):
     if robot_count == 1:
         return 0.0, 0.0, 0.0
 
-    radius = min(0.75, max(0.35, 0.18 * robot_count))
+    pose_radius = min(arena_radius * 0.75, max(0.35, 0.18 * robot_count))
     angle = tau * index / robot_count
-    x = radius * cos(angle)
-    y = radius * sin(angle)
+    x = pose_radius * cos(angle)
+    y = pose_radius * sin(angle)
     rotation = angle + (tau / 2)
     return x, y, rotation
 
@@ -260,13 +288,46 @@ def _load_task_markers(tasks_config_path):
     return task_markers
 
 
-def _generate_world_file(robot_names, task_markers):
-    world_content = [WORLD_HEADER]
+def _build_arena_walls(walls_config):
+    walls = []
+
+    for index, wall in enumerate(walls_config):
+        x = float(wall.get('x', 0.0))
+        y = float(wall.get('y', 0.0))
+        width = float(wall.get('width', 0.02))
+        depth = float(wall.get('depth', 0.50))
+        height = float(wall.get('height', 0.16))
+        color = wall.get('color', [0.5, 0.5, 0.5])
+        red = float(color[0])
+        green = float(color[1])
+        blue = float(color[2])
+        z = height / 2.0
+
+        walls.append(
+            WALL_TEMPLATE.substitute(
+                x=f'{x:.6f}',
+                y=f'{y:.6f}',
+                z=f'{z:.6f}',
+                width=f'{width:.6f}',
+                depth=f'{depth:.6f}',
+                height=f'{height:.6f}',
+                red=f'{red:.3f}',
+                green=f'{green:.3f}',
+                blue=f'{blue:.3f}',
+            )
+        )
+
+    return walls
+
+
+def _generate_world_file(robot_names, task_markers, arena_radius, arena_walls):
+    world_content = [WORLD_HEADER_TEMPLATE.substitute(arena_radius=f'{arena_radius:.6f}')]
+    world_content.extend(arena_walls)
 
     world_content.extend(task_markers)
 
     for index, robot_name in enumerate(robot_names):
-        translation_x, translation_y, rotation = _build_robot_pose(index, len(robot_names))
+        translation_x, translation_y, rotation = _build_robot_pose(index, len(robot_names), arena_radius)
         world_content.append(
             ROBOT_TEMPLATE.substitute(
                 robot_name=robot_name,
@@ -296,7 +357,8 @@ def generate_launch_description():
     robot_count = robot_config['robot_count']
     robot_names = _build_robot_names(robot_count)
     task_markers = _load_task_markers(tasks_config_path)
-    world_path = _generate_world_file(robot_names, task_markers)
+    arena_walls = _build_arena_walls(robot_config['arena_walls'])
+    world_path = _generate_world_file(robot_names, task_markers, robot_config['arena_radius'], arena_walls)
 
     webots = WebotsLauncher(
         world=world_path
@@ -310,7 +372,9 @@ def generate_launch_description():
                 robot_name=robot_name,
                 namespace=robot_name,
                 parameters=[
-                    {'robot_description': robot_description_path},
+                    {
+                        'robot_description': robot_description_path,
+                    },
                 ],
                 respawn=True,
             )
@@ -328,6 +392,7 @@ def generate_launch_description():
                         'max_linear_speed': robot_config['max_linear_speed'],
                         'max_angular_speed': robot_config['max_angular_speed'],
                         'enable_path_visualization': robot_config['display_paths'],
+                        'arena_radius': robot_config['arena_radius'],
                     },
                 ],
             )
