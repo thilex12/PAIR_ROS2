@@ -203,7 +203,12 @@ def _load_robot_configuration(package_dir):
     with open(config_path, 'r', encoding='utf-8') as config_file:
         configuration = yaml.safe_load(config_file) or {}
 
-    return max(1, int(configuration.get('robot_count', 1)))
+    return {
+        'robot_count': max(1, int(configuration.get('robot_count', 1))),
+        'display_paths': bool(configuration.get('display_paths', False)),
+        'max_linear_speed': float(configuration.get('max_linear_speed', 0.12)),
+        'max_angular_speed': float(configuration.get('max_angular_speed', 2.0)),
+    }
 
 
 def _build_robot_names(robot_count):
@@ -287,7 +292,8 @@ def generate_launch_description():
     package_dir = get_package_share_directory('my_package')
     robot_description_path = os.path.join(package_dir, 'resource', 'my_robot.urdf')
     tasks_config_path = os.path.join(package_dir, 'config', 'cbba_tasks.yaml')
-    robot_count = _load_robot_configuration(package_dir)
+    robot_config = _load_robot_configuration(package_dir)
+    robot_count = robot_config['robot_count']
     robot_names = _build_robot_names(robot_count)
     task_markers = _load_task_markers(tasks_config_path)
     world_path = _generate_world_file(robot_names, task_markers)
@@ -319,6 +325,9 @@ def generate_launch_description():
                     {
                         'robot_name': robot_name,
                         'tasks_config': tasks_config_path,
+                        'max_linear_speed': robot_config['max_linear_speed'],
+                        'max_angular_speed': robot_config['max_angular_speed'],
+                        'enable_path_visualization': robot_config['display_paths'],
                     },
                 ],
             )

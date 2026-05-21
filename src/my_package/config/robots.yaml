@@ -1,1 +1,8 @@
 robot_count: 5
+
+# When false, CBBA agents do not publish paths and nothing is drawn in Webots.
+display_paths: false
+
+# CBBA agent speed limits.
+max_linear_speed: 0.4
+max_angular_speed: 2.0

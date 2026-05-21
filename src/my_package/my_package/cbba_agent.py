@@ -73,6 +73,7 @@ class CbbaAgent(Node):
         self.declare_parameter('obstacles_config', '')
         self.declare_parameter('path_publish_interval', 0.6)
         self.declare_parameter('max_path_points', 50)
+        self.declare_parameter('enable_path_visualization', True)
 
         self.__robot_name = self.get_parameter('robot_name').get_parameter_value().string_value
         if not self.__robot_name:
@@ -91,6 +92,7 @@ class CbbaAgent(Node):
         self.__robot_avoidance_radius = self.get_parameter('robot_avoidance_radius').get_parameter_value().double_value
         self.__path_publish_interval = max(0.0, self.get_parameter('path_publish_interval').get_parameter_value().double_value)
         self.__max_path_points = max(1, self.get_parameter('max_path_points').get_parameter_value().integer_value)
+        self.__enable_path_visualization = self.get_parameter('enable_path_visualization').get_parameter_value().bool_value
 
         self.__last_path_pub_time = 0.0
         self.__last_published_path: list[tuple[float, float]] | None = None
@@ -523,22 +525,23 @@ class CbbaAgent(Node):
         else:
             path_to_publish = path
 
-        now = time.time()
-        try:
-            should_publish = False
-            if now - self.__last_path_pub_time >= self.__path_publish_interval:
-                if self.__last_published_path != path_to_publish:
-                    should_publish = True
+        if self.__enable_path_visualization:
+            now = time.time()
+            try:
+                should_publish = False
+                if now - self.__last_path_pub_time >= self.__path_publish_interval:
+                    if self.__last_published_path != path_to_publish:
+                        should_publish = True
 
-            if should_publish:
-                payload = {'robot_name': self.__robot_name, 'task_id': target_task.task_id, 'path': [[float(x), float(y)] for x, y in path_to_publish]}
-                msg = String()
-                msg.data = json.dumps(payload)
-                self.__path_publisher.publish(msg)
-                self.__last_path_pub_time = now
-                self.__last_published_path = list(path_to_publish)
-        except Exception:
-            pass
+                if should_publish:
+                    payload = {'robot_name': self.__robot_name, 'task_id': target_task.task_id, 'path': [[float(x), float(y)] for x, y in path_to_publish]}
+                    msg = String()
+                    msg.data = json.dumps(payload)
+                    self.__path_publisher.publish(msg)
+                    self.__last_path_pub_time = now
+                    self.__last_published_path = list(path_to_publish)
+            except Exception:
+                pass
 
         # follow first path waypoint
         nav_x, nav_y = path[0] if path else (target_task.x, target_task.y)
