@@ -16,10 +16,31 @@ from webots_ros2_driver.webots_controller import WebotsController
 
 ROBOT_NAME_PREFIX = 'auto_robot_'
 
-# Number of waypoint spheres pre-allocated per robot in the world file.
-# The driver moves them into path positions via setSFVec3f — no scene-tree
-# structural changes at runtime, avoiding the importMFNodeFromString crash.
 PATH_SPHERE_COUNT = 40
+
+# One colour per robot — used for both the robot body and its path spheres.
+ROBOT_COLORS = [
+    [0, 0, 1],
+    [0, 1, 0],
+    [1, 0, 0],
+    [1, 1, 0],
+    [1, 0, 1],
+    [0, 1, 1],
+    [1, 0.5, 0],
+    [0.5, 0, 1],
+    [1, 0.5, 0.5],
+    [0.5, 1, 0],
+    [0.3, 0.3, 1],
+    [0.3, 1, 0.3],
+    [1, 0.3, 0.3],
+    [0.7, 0.7, 0],
+    [0.7, 0, 0.7],
+    [0, 0.7, 0.7],
+    [1, 0.7, 0.3],
+    [0.3, 0.7, 1],
+    [0.7, 1, 0.3],
+    [1, 0.3, 0.7],
+]
 
 WORLD_HEADER_TEMPLATE = Template("""#VRML_SIM R2022b utf8
 
@@ -86,9 +107,6 @@ TASK_MARKER_TEMPLATE = Template("""DEF TASK_$task_name Transform {
 }
 """)
 
-# Small sphere used as a path waypoint marker.
-# Starts hidden at y=999; the driver moves it via setSFVec3f each step.
-# Using a pre-existing node avoids any scene-tree structural writes at runtime.
 PATH_SPHERE_TEMPLATE = Template("""DEF ${def_name} Transform {
     translation 0 999 0
     children [
@@ -173,7 +191,7 @@ ROBOT_TEMPLATE = Template("""Robot {
             children [
                 Shape {
                     appearance PBRAppearance {
-                        baseColor 0 0 1
+                        baseColor $body_red $body_green $body_blue
                         roughness 1
                         metalness 0
                     }
@@ -334,29 +352,13 @@ def _walls_config_to_segments(walls_config: list) -> list:
 
 
 def _build_path_spheres(robot_names: list, display_paths: bool) -> list:
-    """Pre-allocate waypoint spheres for each robot in the world file.
-
-    When display_paths is False we skip generation entirely to keep the
-    world file lean.  When True, each robot gets PATH_SPHERE_COUNT spheres
-    parked far outside the arena (y=999).  The driver repositions them with
-    setSFVec3f — a plain field write that is stable on WSL/Windows Webots,
-    unlike importMFNodeFromString which crashes with exit code 5.
-    """
+    """Pre-allocate waypoint spheres for each robot, using the same colour as the robot body."""
     if not display_paths:
         return []
 
-    # One distinct colour per robot so paths are easy to tell apart.
-    palette = [
-        (0.0, 0.6, 1.0),   # blue
-        (1.0, 0.4, 0.0),   # orange
-        (0.2, 0.9, 0.3),   # green
-        (0.9, 0.1, 0.8),   # magenta
-        (1.0, 0.9, 0.0),   # yellow
-    ]
-
     nodes = []
     for robot_index, robot_name in enumerate(robot_names):
-        r, g, b = palette[robot_index % len(palette)]
+        r, g, b = ROBOT_COLORS[robot_index % len(ROBOT_COLORS)]
         for sphere_index in range(PATH_SPHERE_COUNT):
             nodes.append(PATH_SPHERE_TEMPLATE.substitute(
                 def_name=f'PATH_{robot_name}_{sphere_index}',
@@ -373,11 +375,13 @@ def _generate_world_file(robot_names, task_markers, arena_radius, arena_walls, p
 
     for index, robot_name in enumerate(robot_names):
         tx, ty, rot = _build_robot_pose(index, len(robot_names), arena_radius)
+        r, g, b = ROBOT_COLORS[index % len(ROBOT_COLORS)]
         world_content.append(ROBOT_TEMPLATE.substitute(
             robot_name=robot_name,
             translation_x=f'{tx:.6f}', translation_y=f'{ty:.6f}',
             rotation=f'{rot:.6f}',
             left_wheel_offset='0.045',
+            body_red=f'{r:.3f}', body_green=f'{g:.3f}', body_blue=f'{b:.3f}',
         ))
 
     world_content.append(WORLD_FOOTER)

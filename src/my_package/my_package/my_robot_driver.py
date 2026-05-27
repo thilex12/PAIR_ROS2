@@ -52,17 +52,11 @@ class MyRobotDriver:
         self.__cbba_known_tasks: set = set()
 
         # Path visualisation state.
-        # __pending_path is written by the ROS callback and read inside step().
-        # step() is the only place that calls Webots APIs, keeping everything
-        # on the same thread and avoiding the WSL/Windows crash.
         self.__pending_path: list | None = None
         self.__path_dirty: bool = False
         self.__drawn_path: list | None = None
         self.__last_redraw_time: float = 0.0
 
-        # Pre-fetch the translation fields of the sphere nodes created in the
-        # world file by the launch file.  Caching avoids repeated getFromDef
-        # calls every step.
         self.__sphere_translation_fields: list = []
 
     # -------------------------------------------------------------------------
@@ -91,11 +85,9 @@ class MyRobotDriver:
             except Exception:
                 continue
 
-        if not clean:
-            return
-
-        # Downsample to sphere budget.
-        if len(clean) > PATH_SPHERE_COUNT:
+        # Allow empty path through — it signals that all spheres should be parked.
+        # Downsample to sphere budget only for non-empty paths.
+        if clean and len(clean) > PATH_SPHERE_COUNT:
             step = max(1, len(clean) // PATH_SPHERE_COUNT)
             downsampled = [clean[i] for i in range(0, len(clean), step)]
             if downsampled[-1] != clean[-1]:
@@ -141,19 +133,20 @@ class MyRobotDriver:
             self.__publish_pose()
             self.__apply_motors()
 
-            # Lazily build the sphere field cache on first step (world is ready).
             if not self.__sphere_translation_fields:
                 self.__cache_sphere_fields()
 
-            # Redraw path if changed and throttle interval has elapsed.
+            # Redraw path if changed; empty path parks all spheres immediately
+            # (no throttle so the clear is instantaneous).
             now = time.time()
-            if (self.__path_dirty
-                    and self.__pending_path is not None
-                    and now - self.__last_redraw_time >= PATH_REDRAW_INTERVAL):
-                self.__redraw_path(self.__pending_path)
-                self.__drawn_path = self.__pending_path
-                self.__path_dirty = False
-                self.__last_redraw_time = now
+            if self.__path_dirty and self.__pending_path is not None:
+                is_clear = len(self.__pending_path) == 0
+                if is_clear or now - self.__last_redraw_time >= PATH_REDRAW_INTERVAL:
+                    self.__redraw_path(self.__pending_path)
+                    self.__drawn_path = self.__pending_path
+                    self.__path_dirty = False
+                    if not is_clear:
+                        self.__last_redraw_time = now
 
         except Exception as exc:
             try:
@@ -166,12 +159,6 @@ class MyRobotDriver:
     # -------------------------------------------------------------------------
 
     def __cache_sphere_fields(self) -> None:
-        """Look up and cache the translation field of every path sphere node.
-
-        DEF names follow the pattern PATH_<robot_name>_<index> as set by the
-        launch file.  If a node is not found (e.g. display_paths was False),
-        the list stays empty and no drawing is attempted.
-        """
         fields = []
         for i in range(PATH_SPHERE_COUNT):
             def_name = f'PATH_{self.__robot_name}_{i}'
@@ -186,14 +173,10 @@ class MyRobotDriver:
         self.__sphere_translation_fields = fields
 
     def __redraw_path(self, path: list) -> None:
-        """Move pre-allocated spheres to path positions; park unused ones.
-
-        This only calls setSFVec3f on already-existing nodes — no structural
-        scene-tree changes — which is stable on Windows Webots launched from WSL.
-        """
+        """Move pre-allocated spheres to path positions; park unused ones."""
         fields = self.__sphere_translation_fields
         if not fields:
-            return  # spheres not available (display_paths was False at launch)
+            return
 
         for i, field in enumerate(fields):
             try:

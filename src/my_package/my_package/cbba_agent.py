@@ -75,8 +75,6 @@ class CbbaAgent(Node):
         self.declare_parameter('path_publish_interval', 0.6)
         self.declare_parameter('max_path_points', 50)
         self.declare_parameter('enable_path_visualization', True)
-        # Wall segments serialized as JSON by the launch file.
-        # Format: list of {x1, y1, x2, y2, thickness} dicts.
         self.declare_parameter('walls_json', '[]')
 
         self.__robot_name = self.get_parameter('robot_name').get_parameter_value().string_value
@@ -108,13 +106,9 @@ class CbbaAgent(Node):
 
         self.__tasks = self.__load_tasks(tasks_config)
 
-        # Load static obstacles and walls from optional obstacles_config file.
         obstacles_config = self.get_parameter('obstacles_config').get_parameter_value().string_value
         self.__static_obstacles, self.__walls = self.__load_static_obstacles(obstacles_config)
 
-        # Load wall segments injected by the launch file (from robots.yaml arena_walls).
-        # These are the same walls rendered in Webots, so the A* planner now has
-        # full knowledge of them without any sensor-based mapping.
         walls_json = self.get_parameter('walls_json').get_parameter_value().string_value
         self.__walls = self.__walls + self.__parse_walls_json(walls_json)
 
@@ -126,6 +120,12 @@ class CbbaAgent(Node):
         self.__abandoned_tasks: set[str] = set()
         self.__winner_table: dict[str, WinnerEntry] = {}
         self.__peer_state: dict[str, dict[str, Any]] = {}
+
+        # Cache for A* path lengths used during bid scoring.
+        # Key: (from_x_cell, from_y_cell, to_x_cell, to_y_cell)
+        # Value: float path length in world units
+        # Cleared at the start of every __rebuild_bundle call.
+        self.__path_length_cache: dict[tuple[int, int, int, int], float] = {}
 
         # subscriptions
         self.create_subscription(PoseStamped, 'pose', self.__pose_callback, 1)
@@ -146,11 +146,6 @@ class CbbaAgent(Node):
         )
 
     def __parse_walls_json(self, walls_json: str) -> list[WallSegment]:
-        """Parse the walls_json parameter into WallSegment objects.
-
-        The launch file serializes arena_walls from robots.yaml as a JSON list
-        of line-segment dicts: {x1, y1, x2, y2, thickness}.
-        """
         segments: list[WallSegment] = []
         try:
             raw = json.loads(walls_json)
@@ -169,62 +164,47 @@ class CbbaAgent(Node):
     def __load_tasks(self, tasks_config: str) -> list[Task]:
         if not tasks_config:
             return []
-
         config_path = Path(tasks_config)
         if not config_path.is_file():
             self.get_logger().warning(f'Tasks config not found: {tasks_config}')
             return []
-
         with config_path.open('r', encoding='utf-8') as tasks_file:
             configuration = yaml.safe_load(tasks_file) or {}
-
         tasks = []
         for task_data in configuration.get('tasks', []):
-            tasks.append(
-                Task(
-                    task_id=str(task_data['id']),
-                    x=float(task_data['x']),
-                    y=float(task_data['y']),
-                    reward=float(task_data.get('reward', 1.0)),
-                )
-            )
-
+            tasks.append(Task(
+                task_id=str(task_data['id']),
+                x=float(task_data['x']),
+                y=float(task_data['y']),
+                reward=float(task_data.get('reward', 1.0)),
+            ))
         return tasks
 
     def __load_static_obstacles(self, obstacles_config: str) -> tuple[list[StaticObstacle], list[WallSegment]]:
         if not obstacles_config:
             return [], []
-
         config_path = Path(obstacles_config)
         if not config_path.is_file():
             self.get_logger().warning(f'Obstacles config not found: {obstacles_config}')
             return [], []
-
         with config_path.open('r', encoding='utf-8') as obstacles_file:
             configuration = yaml.safe_load(obstacles_file) or {}
-
         obstacles: list[StaticObstacle] = []
         for obstacle_data in configuration.get('static_obstacles', []):
-            obstacles.append(
-                StaticObstacle(
-                    x=float(obstacle_data['x']),
-                    y=float(obstacle_data['y']),
-                    radius=float(obstacle_data.get('radius', 0.08)),
-                )
-            )
-
+            obstacles.append(StaticObstacle(
+                x=float(obstacle_data['x']),
+                y=float(obstacle_data['y']),
+                radius=float(obstacle_data.get('radius', 0.08)),
+            ))
         walls: list[WallSegment] = []
         for wall_data in configuration.get('walls', []):
-            walls.append(
-                WallSegment(
-                    x1=float(wall_data['x1']),
-                    y1=float(wall_data['y1']),
-                    x2=float(wall_data['x2']),
-                    y2=float(wall_data['y2']),
-                    thickness=float(wall_data.get('thickness', 0.04)),
-                )
-            )
-
+            walls.append(WallSegment(
+                x1=float(wall_data['x1']),
+                y1=float(wall_data['y1']),
+                x2=float(wall_data['x2']),
+                y2=float(wall_data['y2']),
+                thickness=float(wall_data.get('thickness', 0.04)),
+            ))
         return obstacles, walls
 
     def __pose_callback(self, message: PoseStamped) -> None:
@@ -244,28 +224,23 @@ class CbbaAgent(Node):
             payload = json.loads(message.data)
         except json.JSONDecodeError:
             return
-
         sender = payload.get('robot_name')
         if not sender or sender == self.__robot_name:
             return
-
         self.__peer_state[sender] = payload
 
     def __timer_callback(self) -> None:
         if self.__pose is None or not self.__tasks:
             self.__publish_idle_state()
             return
-
         self.__merge_peer_winners()
         self.__merge_peer_completions()
-
         if self.__all_tasks_completed():
             self.__bundle.clear()
             self.__publish_idle_state()
             self.__publish_state()
             self.__publish_assignment_summary()
             return
-
         self.__rebuild_bundle()
         self.__publish_command()
         self.__publish_state()
@@ -279,7 +254,6 @@ class CbbaAgent(Node):
                     robot=str(winner_data.get('robot', '')),
                     score=float(winner_data.get('score', 0.0)),
                 )
-
                 local_entry = self.__winner_table.get(task_id)
                 if local_entry is None or self.__is_better_winner(peer_entry, local_entry):
                     if local_entry is not None and local_entry.robot == self.__robot_name and task_id in self.__bundle:
@@ -288,14 +262,11 @@ class CbbaAgent(Node):
 
     def __merge_peer_completions(self) -> None:
         peer_completed_tasks: set[str] = set()
-
         for peer_state in self.__peer_state.values():
             peer_completed_tasks.update(str(task_id) for task_id in peer_state.get('completed_tasks', []))
-
         for task_id in peer_completed_tasks:
             if task_id in self.__completed_tasks:
                 continue
-
             self.__completed_tasks.add(task_id)
             self.__abandoned_tasks.discard(task_id)
             self.__winner_table.pop(task_id, None)
@@ -305,29 +276,23 @@ class CbbaAgent(Node):
     def __all_tasks_completed(self) -> bool:
         if not self.__tasks:
             return True
-
         completed_task_ids = set(self.__completed_tasks)
         for peer_state in self.__peer_state.values():
             completed_task_ids.update(str(task_id) for task_id in peer_state.get('completed_tasks', []))
-
         return all(task.task_id in completed_task_ids for task in self.__tasks)
 
     def __abandon_from_task(self, task_id: str, winning_peer: WinnerEntry | None = None) -> None:
         if task_id not in self.__bundle:
             return
-
         abandon_index = self.__bundle.index(task_id)
         abandoned_bundle = self.__bundle[abandon_index:]
-
         for abandoned_task_id in abandoned_bundle:
             self.__abandoned_tasks.add(abandoned_task_id)
             if abandoned_task_id not in self.__completed_tasks:
                 local_entry = self.__winner_table.get(abandoned_task_id)
                 if local_entry is not None and local_entry.robot == self.__robot_name:
                     self.__winner_table.pop(abandoned_task_id, None)
-
         self.__bundle = self.__bundle[:abandon_index]
-
         if winning_peer is not None:
             self.get_logger().info(
                 f'Robot {self.__robot_name} abandons task {task_id} after losing to '
@@ -339,10 +304,10 @@ class CbbaAgent(Node):
     def __is_better_winner(self, candidate: WinnerEntry, incumbent: WinnerEntry) -> bool:
         if candidate.score != incumbent.score:
             return candidate.score > incumbent.score
-
         return candidate.robot < incumbent.robot
 
     # -- A* utilities -------------------------------------------------
+
     def __world_to_cell(self, x: float, y: float) -> tuple[int, int]:
         return (int(round(x / self.__path_resolution)), int(round(y / self.__path_resolution)))
 
@@ -361,34 +326,20 @@ class CbbaAgent(Node):
         return _distance(px, py, qx, qy)
 
     def __cell_is_blocked(self, cx: int, cy: int, start_cell: tuple[int, int], goal_cell: tuple[int, int]) -> bool:
-        # Never block the start or goal cells, even if they are near a wall.
         if (cx, cy) == start_cell or (cx, cy) == goal_cell:
             return False
-
         wx, wy = self.__cell_to_world(cx, cy)
-
-        # Cells outside the arena boundary are always blocked.
         if math.hypot(wx, wy) > self.__arena_radius:
             return True
-
-        # Static circular obstacles loaded from obstacles_config.
         for obs in self.__static_obstacles:
             if _distance(wx, wy, obs.x, obs.y) <= obs.radius + self.__path_resolution * 0.5:
                 return True
-
-        # Wall segments: combines both obstacles_config walls and arena_walls
-        # injected by the launch file.
-        # Clearance = half wall thickness + robot body radius (0.045 m) + safety margin (0.06 m).
-        # The safety margin ensures the A* path stays comfortably away from the
-        # wall surface so the robot never clips it during navigation.
         _ROBOT_RADIUS = 0.045
         _WALL_SAFETY_MARGIN = 0.06
         for w in self.__walls:
             clearance = w.thickness / 2.0 + _ROBOT_RADIUS + _WALL_SAFETY_MARGIN
             if self.__distance_to_segment(wx, wy, w.x1, w.y1, w.x2, w.y2) <= clearance:
                 return True
-
-        # Dynamic robot positions received from peer state messages.
         for peer_state in self.__peer_state.values():
             pose = peer_state.get('pose', {})
             try:
@@ -398,7 +349,6 @@ class CbbaAgent(Node):
                 continue
             if _distance(wx, wy, px, py) <= self.__robot_avoidance_radius:
                 return True
-
         return False
 
     def __astar_path(self, sx: float, sy: float, gx: float, gy: float) -> list[tuple[float, float]]:
@@ -412,7 +362,6 @@ class CbbaAgent(Node):
         came_from: dict[tuple[int, int], tuple[int, int]] = {}
         gscore: dict[tuple[int, int], float] = {start: 0.0}
         closed: set[tuple[int, int]] = set()
-
         neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
 
         while open_heap:
@@ -421,7 +370,6 @@ class CbbaAgent(Node):
             if current in closed:
                 continue
             if current == goal:
-                # Reconstruct path from goal back to start.
                 path_cells = []
                 cur = current
                 while cur != start:
@@ -429,11 +377,9 @@ class CbbaAgent(Node):
                     cur = came_from[cur]
                 path_cells.reverse()
                 path = [self.__cell_to_world(px, py) for px, py in path_cells]
-                # Ensure the precise goal coordinates are the last waypoint.
                 if not path or _distance(path[-1][0], path[-1][1], gx, gy) > self.__path_resolution * 0.6:
                     path.append((gx, gy))
                 return path
-
             closed.add(current)
             for dx, dy in neighbors:
                 nx, ny = cx + dx, cy + dy
@@ -447,11 +393,53 @@ class CbbaAgent(Node):
                     heuristic = math.hypot(goal[0] - nx, goal[1] - ny)
                     heapq.heappush(open_heap, (tentative_g + heuristic, nx, ny))
 
-        # A* failed to find a path: return a direct fallback waypoint.
         return [(gx, gy)]
 
+    def __astar_path_length(self, sx: float, sy: float, gx: float, gy: float) -> float:
+        """Return the A* path length in world units, with per-rebuild caching.
+
+        The cache key is based on grid cells so nearby positions hash to the
+        same entry and avoid redundant searches.  Peer-robot positions are NOT
+        included in the key — they change every timer tick but we only need a
+        stable cost estimate for the bid; the actual navigation path is
+        recomputed fresh in __publish_command.
+        """
+        sc = self.__world_to_cell(sx, sy)
+        gc = self.__world_to_cell(gx, gy)
+        cache_key = (sc[0], sc[1], gc[0], gc[1])
+
+        if cache_key in self.__path_length_cache:
+            return self.__path_length_cache[cache_key]
+
+        path = self.__astar_path(sx, sy, gx, gy)
+
+        # Sum Euclidean distances between consecutive waypoints.
+        length = 0.0
+        prev = (sx, sy)
+        for wp in path:
+            length += _distance(prev[0], prev[1], wp[0], wp[1])
+            prev = wp
+
+        # If A* only returned the goal (fallback), use straight-line distance
+        # but apply a large penalty so robots behind walls bid less.
+        if len(path) == 1 and path[0] == (gx, gy):
+            euclidean = _distance(sx, sy, gx, gy)
+            if length > euclidean * 1.05:
+                pass  # genuine detour path
+            else:
+                # Fallback: penalise heavily to discourage the blocked robot
+                length = euclidean * 3.0
+
+        self.__path_length_cache[cache_key] = length
+        return length
+
     # -- CBBA core ----------------------------------------------------
+
     def __rebuild_bundle(self) -> None:
+        # Clear the path-length cache at the start of each rebuild so costs
+        # reflect the current world state (completed tasks, peer positions).
+        self.__path_length_cache.clear()
+
         for task_id in list(self.__bundle):
             winner = self.__winner_table.get(task_id)
             if winner is not None and winner.robot != self.__robot_name:
@@ -491,7 +479,12 @@ class CbbaAgent(Node):
             current_y = selected_task.y
 
     def __score_for_task(self, task: Task, from_x: float, from_y: float) -> float:
-        travel_cost = _distance(from_x, from_y, task.x, task.y)
+        """Score using the A* path length as travel cost instead of Euclidean distance.
+
+        This makes robots behind walls bid lower than robots with a clear path,
+        so tasks are assigned to whichever robot can actually reach them faster.
+        """
+        travel_cost = self.__astar_path_length(from_x, from_y, task.x, task.y)
         return task.reward - travel_cost
 
     def __task_by_id(self, task_id: str) -> Task:
@@ -502,7 +495,6 @@ class CbbaAgent(Node):
 
     def __publish_state(self) -> None:
         assert self.__pose is not None
-
         payload = {
             'robot_name': self.__robot_name,
             'pose': {
@@ -514,21 +506,16 @@ class CbbaAgent(Node):
             'completed_tasks': sorted(self.__completed_tasks),
             'abandoned_tasks': sorted(self.__abandoned_tasks),
             'winner_table': {
-                task_id: {
-                    'robot': winner.robot,
-                    'score': winner.score,
-                }
+                task_id: {'robot': winner.robot, 'score': winner.score}
                 for task_id, winner in self.__winner_table.items()
             },
         }
-
         message = String()
         message.data = json.dumps(payload)
         self.__state_publisher.publish(message)
 
     def __publish_assignment_summary(self) -> None:
         assigned_tasks = {task_id: winner.robot for task_id, winner in self.__winner_table.items()}
-
         payload = {
             'robot_name': self.__robot_name,
             'bundle': list(self.__bundle),
@@ -536,7 +523,6 @@ class CbbaAgent(Node):
             'completed_tasks': sorted(self.__completed_tasks),
             'abandoned_tasks': sorted(self.__abandoned_tasks),
         }
-
         message = String()
         message.data = json.dumps(payload)
         self.__assignment_publisher.publish(message)
@@ -544,11 +530,21 @@ class CbbaAgent(Node):
     def __publish_idle_state(self) -> None:
         self.__cmd_vel_publisher.publish(Twist())
 
+    def __clear_path_visualization(self) -> None:
+        """Publish an empty path so the driver parks all spheres back at y=999."""
+        if not self.__enable_path_visualization:
+            return
+        payload = {'robot_name': self.__robot_name, 'task_id': '', 'path': []}
+        msg = String()
+        msg.data = json.dumps(payload)
+        self.__path_publisher.publish(msg)
+        self.__last_published_path = None
+
     def __publish_command(self) -> None:
         command_message = Twist()
-
         if not self.__bundle:
             self.__cmd_vel_publisher.publish(command_message)
+            self.__clear_path_visualization()
             return
 
         target_task = self.__task_by_id(self.__bundle[0])
@@ -563,10 +559,8 @@ class CbbaAgent(Node):
             self.__cmd_vel_publisher.publish(command_message)
             return
 
-        # Compute A* path from current position to the target task.
         path = self.__astar_path(current_x, current_y, target_task.x, target_task.y)
 
-        # Downsample long paths to stay within the max_path_points budget.
         if len(path) > self.__max_path_points:
             step = max(1, len(path) // self.__max_path_points)
             trimmed = [path[i] for i in range(0, len(path), step)][:self.__max_path_points]
@@ -583,7 +577,6 @@ class CbbaAgent(Node):
                 if now - self.__last_path_pub_time >= self.__path_publish_interval:
                     if self.__last_published_path != path_to_publish:
                         should_publish = True
-
                 if should_publish:
                     payload = {'robot_name': self.__robot_name, 'task_id': target_task.task_id, 'path': [[float(x), float(y)] for x, y in path_to_publish]}
                     msg = String()
@@ -594,7 +587,6 @@ class CbbaAgent(Node):
             except Exception:
                 pass
 
-        # Steer toward the first waypoint on the planned path.
         nav_x, nav_y = path[0] if path else (target_task.x, target_task.y)
         heading = math.atan2(nav_y - current_y, nav_x - current_x)
         heading_error = _normalize_angle(heading - current_yaw)
@@ -604,8 +596,6 @@ class CbbaAgent(Node):
         linear_speed *= max(0.0, 1.0 - abs(heading_error) / math.pi)
         angular_speed = max(-self.__max_angular_speed, min(self.__max_angular_speed, self.__angular_gain * heading_error))
 
-        # Distance-sensor emergency stop: if an obstacle is too close, rotate in
-        # place away from it.  This is a last-resort reflex, not a mapping step.
         if self.__left_range < self.__clearance_threshold or self.__right_range < self.__clearance_threshold:
             command_message.linear.x = 0.0
             command_message.angular.z = -angular_speed if self.__left_range < self.__right_range else angular_speed
