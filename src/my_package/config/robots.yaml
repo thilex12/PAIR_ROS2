@@ -2,12 +2,30 @@
 robot_count: 2
 arena_radius: 2.0
 arena_walls:
+  # Main vertical divider — splits arena into left and right zones.
+  # Robots on the wrong side must go around via the top or bottom gap.
   - x: 0.25
     y: 0.0
     width: 0.04
     depth: 1.4
     height: 0.16
-    color: [0.5, 0.5, 0.5]
+    color: [0.45, 0.45, 0.45]
+
+  # Upper cross wall — closes the top passage, forcing robots into the central corridor.
+  - x: -0.20
+    y: 0.55
+    width: 0.90
+    depth: 0.04
+    height: 0.16
+    color: [0.45, 0.45, 0.45]
+
+  # Lower cross wall — mirrors the upper one, closes the bottom passage.
+  - x: -0.20
+    y: -0.55
+    width: 0.90
+    depth: 0.04
+    height: 0.16
+    color: [0.45, 0.45, 0.45]
 
 # When false, CBBA agents do not publish paths and nothing is drawn in Webots.
 display_paths: true

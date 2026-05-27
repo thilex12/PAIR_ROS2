@@ -11,9 +11,14 @@ from math import atan2, cos, sin
 HALF_DISTANCE_BETWEEN_WHEELS = 0.045
 WHEEL_RADIUS = 0.025
 
-# Maximum number of path points rendered in Webots.
-# Keeping this low avoids overloading the scene-tree insertion.
-MAX_PATH_POINTS = 40
+# Must match PATH_SPHERE_COUNT in cbba_launch.py.
+PATH_SPHERE_COUNT = 40
+
+# Minimum seconds between full path redraws.
+PATH_REDRAW_INTERVAL = 0.8
+
+# Park position for unused spheres (far outside the arena).
+HIDDEN_POS = [0.0, 999.0, 0.0]
 
 
 class MyRobotDriver:
@@ -24,10 +29,8 @@ class MyRobotDriver:
 
         self.__left_motor = self.__robot.getDevice('left wheel motor')
         self.__right_motor = self.__robot.getDevice('right wheel motor')
-
         self.__left_motor.setPosition(float('inf'))
         self.__left_motor.setVelocity(0)
-
         self.__right_motor.setPosition(float('inf'))
         self.__right_motor.setVelocity(0)
 
@@ -36,58 +39,53 @@ class MyRobotDriver:
         if not rclpy.ok():
             rclpy.init(args=None)
 
-        self.__node = rclpy.create_node(f'{self.__robot_name}_driver', namespace=self.__robot_name)
+        self.__node = rclpy.create_node(
+            f'{self.__robot_name}_driver', namespace=self.__robot_name
+        )
         self.__node.create_subscription(Twist, 'cmd_vel', self.__cmd_vel_callback, 1)
         self.__node.create_subscription(String, '/cbba/state', self.__cbba_state_callback, 10)
         self.__node.create_subscription(String, 'cbba_path', self.__path_callback, 10)
         self.__pose_publisher = self.__node.create_publisher(PoseStamped, 'pose', 1)
 
-        self.__cbba_completed: set[str] = set()
-        self.__cbba_inprogress: set[str] = set()
-        self.__cbba_known_tasks: set[str] = set()
+        self.__cbba_completed: set = set()
+        self.__cbba_inprogress: set = set()
+        self.__cbba_known_tasks: set = set()
 
-        # Path drawing state ---------------------------------------------------
-        # __pending_path holds the latest path received from the agent.
-        # It is written by __path_callback (ROS thread) and consumed by step()
-        # (Webots thread).  We use a simple replace-on-update approach: step()
-        # checks __path_dirty and redraws only when something changed.
-        self.__pending_path: list[tuple[float, float]] | None = None
+        # Path visualisation state.
+        # __pending_path is written by the ROS callback and read inside step().
+        # step() is the only place that calls Webots APIs, keeping everything
+        # on the same thread and avoiding the WSL/Windows crash.
+        self.__pending_path: list | None = None
         self.__path_dirty: bool = False
-        self.__drawn_path: list[tuple[float, float]] | None = None
-        self.__last_path_time: float = 0.0
-        # Minimum seconds between path redraws to avoid flooding the scene tree.
-        self.__path_redraw_interval: float = 1.0
+        self.__drawn_path: list | None = None
+        self.__last_redraw_time: float = 0.0
+
+        # Pre-fetch the translation fields of the sphere nodes created in the
+        # world file by the launch file.  Caching avoids repeated getFromDef
+        # calls every step.
+        self.__sphere_translation_fields: list = []
 
     # -------------------------------------------------------------------------
-    # ROS callbacks (called from rclpy.spin_once inside step())
+    # ROS callbacks — must NOT touch Webots APIs
     # -------------------------------------------------------------------------
 
     def __cmd_vel_callback(self, twist: Twist) -> None:
         self.__target_twist = twist
 
     def __path_callback(self, message: String) -> None:
-        """Receive a path from the CBBA agent and store it for drawing in step().
-
-        We intentionally do NOT touch the Webots scene tree here — that must
-        only happen inside step() to avoid thread-safety crashes.
-        """
+        """Buffer the latest path for drawing in step(); never touch Webots here."""
         try:
             payload = json.loads(message.data)
         except Exception:
             return
 
-        # Only process paths meant for this robot.
         if payload.get('robot_name') != self.__robot_name:
             return
 
-        raw_path = payload.get('path', [])
-
-        # Validate and sanitise each point.
-        clean: list[tuple[float, float]] = []
-        for point in raw_path:
+        clean = []
+        for point in payload.get('path', []):
             try:
-                x = float(point[0])
-                y = float(point[1])
+                x, y = float(point[0]), float(point[1])
                 if math.isfinite(x) and math.isfinite(y):
                     clean.append((x, y))
             except Exception:
@@ -96,18 +94,16 @@ class MyRobotDriver:
         if not clean:
             return
 
-        # Downsample to avoid inserting an excessively long coordinate string.
-        if len(clean) > MAX_PATH_POINTS:
-            step = max(1, len(clean) // MAX_PATH_POINTS)
+        # Downsample to sphere budget.
+        if len(clean) > PATH_SPHERE_COUNT:
+            step = max(1, len(clean) // PATH_SPHERE_COUNT)
             downsampled = [clean[i] for i in range(0, len(clean), step)]
-            # Always keep the last point (the goal).
             if downsampled[-1] != clean[-1]:
                 downsampled.append(clean[-1])
-            clean = downsampled[:MAX_PATH_POINTS]
+            clean = downsampled[:PATH_SPHERE_COUNT]
 
-        # Skip redraw if the path has not changed.
         if clean == self.__drawn_path:
-            return
+            return  # nothing changed, skip redraw
 
         self.__pending_path = clean
         self.__path_dirty = True
@@ -122,172 +118,143 @@ class MyRobotDriver:
         bundle = set(payload.get('bundle', []))
         winner_keys = set(payload.get('winner_table', {}).keys())
 
-        self.__cbba_known_tasks.update(completed)
-        self.__cbba_known_tasks.update(bundle)
-        self.__cbba_known_tasks.update(winner_keys)
-
+        self.__cbba_known_tasks.update(completed | bundle | winner_keys)
         self.__cbba_completed.update(completed)
-
-        # Remove completed tasks from in-progress set.
         self.__cbba_inprogress.difference_update(self.__cbba_completed)
         for task_id in bundle:
             if task_id not in self.__cbba_completed:
                 self.__cbba_inprogress.add(task_id)
 
-        # Recolor task markers: green = done, red = not done.
-        for task_id in list(self.__cbba_known_tasks):
+        for task_id in self.__cbba_known_tasks:
             if task_id in self.__cbba_completed:
                 self.__set_task_color(task_id, 0.0, 0.8, 0.0)
             else:
                 self.__set_task_color(task_id, 0.85, 0.15, 0.15)
 
     # -------------------------------------------------------------------------
-    # Webots step — runs in the Webots simulation thread
+    # Webots step — the only place that may call Webots APIs
     # -------------------------------------------------------------------------
 
     def step(self) -> None:
         try:
-            # Process all pending ROS messages.
             rclpy.spin_once(self.__node, timeout_sec=0)
-
-            # Publish the robot's current pose.
             self.__publish_pose()
+            self.__apply_motors()
 
-            # Apply motor velocities from the latest cmd_vel.
-            forward_speed = self.__target_twist.linear.x
-            angular_speed = self.__target_twist.angular.z
-            left_vel = (forward_speed - angular_speed * HALF_DISTANCE_BETWEEN_WHEELS) / WHEEL_RADIUS
-            right_vel = (forward_speed + angular_speed * HALF_DISTANCE_BETWEEN_WHEELS) / WHEEL_RADIUS
-            self.__safe_set_velocity(self.__left_motor, left_vel)
-            self.__safe_set_velocity(self.__right_motor, right_vel)
+            # Lazily build the sphere field cache on first step (world is ready).
+            if not self.__sphere_translation_fields:
+                self.__cache_sphere_fields()
 
-            # Redraw the planned path in the scene tree if it changed and enough
-            # time has passed since the last redraw.
+            # Redraw path if changed and throttle interval has elapsed.
             now = time.time()
-            if self.__path_dirty and self.__pending_path is not None:
-                if now - self.__last_path_time >= self.__path_redraw_interval:
-                    self.__redraw_path(self.__pending_path)
-                    self.__drawn_path = self.__pending_path
-                    self.__path_dirty = False
-                    self.__last_path_time = now
+            if (self.__path_dirty
+                    and self.__pending_path is not None
+                    and now - self.__last_redraw_time >= PATH_REDRAW_INTERVAL):
+                self.__redraw_path(self.__pending_path)
+                self.__drawn_path = self.__pending_path
+                self.__path_dirty = False
+                self.__last_redraw_time = now
 
         except Exception as exc:
             try:
-                self.__node.get_logger().error(f'Unhandled exception in driver step: {exc}')
+                self.__node.get_logger().error(f'step() error: {exc}')
             except Exception:
                 pass
 
     # -------------------------------------------------------------------------
-    # Internal helpers
+    # Internal helpers — all Webots API calls live here
     # -------------------------------------------------------------------------
 
-    def __publish_pose(self) -> None:
-        """Read the robot's ground-truth pose from Webots and publish it."""
-        try:
-            pose_message = PoseStamped()
-            pose_message.header.stamp = self.__node.get_clock().now().to_msg()
-            pose_message.header.frame_id = 'map'
+    def __cache_sphere_fields(self) -> None:
+        """Look up and cache the translation field of every path sphere node.
 
+        DEF names follow the pattern PATH_<robot_name>_<index> as set by the
+        launch file.  If a node is not found (e.g. display_paths was False),
+        the list stays empty and no drawing is attempted.
+        """
+        fields = []
+        for i in range(PATH_SPHERE_COUNT):
+            def_name = f'PATH_{self.__robot_name}_{i}'
+            try:
+                node = self.__robot.getFromDef(def_name)
+                if node is not None:
+                    field = node.getField('translation')
+                    if field is not None:
+                        fields.append(field)
+            except Exception:
+                pass
+        self.__sphere_translation_fields = fields
+
+    def __redraw_path(self, path: list) -> None:
+        """Move pre-allocated spheres to path positions; park unused ones.
+
+        This only calls setSFVec3f on already-existing nodes — no structural
+        scene-tree changes — which is stable on Windows Webots launched from WSL.
+        """
+        fields = self.__sphere_translation_fields
+        if not fields:
+            return  # spheres not available (display_paths was False at launch)
+
+        for i, field in enumerate(fields):
+            try:
+                if i < len(path):
+                    x, y = path[i]
+                    field.setSFVec3f([x, y, 0.03])
+                else:
+                    field.setSFVec3f(HIDDEN_POS)
+            except Exception:
+                pass
+
+    def __publish_pose(self) -> None:
+        try:
+            msg = PoseStamped()
+            msg.header.stamp = self.__node.get_clock().now().to_msg()
+            msg.header.frame_id = 'map'
             position = self.__robot_node.getPosition()
             orientation = self.__robot_node.getOrientation()
-
             try:
                 yaw = atan2(orientation[3], orientation[0])
             except Exception:
                 yaw = 0.0
-
-            pose_message.pose.position.x = position[0]
-            pose_message.pose.position.y = position[1]
-            pose_message.pose.position.z = position[2]
-            pose_message.pose.orientation.z = sin(yaw / 2.0)
-            pose_message.pose.orientation.w = cos(yaw / 2.0)
-            self.__pose_publisher.publish(pose_message)
+            msg.pose.position.x = position[0]
+            msg.pose.position.y = position[1]
+            msg.pose.position.z = position[2]
+            msg.pose.orientation.z = sin(yaw / 2.0)
+            msg.pose.orientation.w = cos(yaw / 2.0)
+            self.__pose_publisher.publish(msg)
         except Exception:
             pass
 
-    def __safe_set_velocity(self, motor, velocity: float) -> None:
+    def __apply_motors(self) -> None:
+        fwd = self.__target_twist.linear.x
+        ang = self.__target_twist.angular.z
+        left = (fwd - ang * HALF_DISTANCE_BETWEEN_WHEELS) / WHEEL_RADIUS
+        right = (fwd + ang * HALF_DISTANCE_BETWEEN_WHEELS) / WHEEL_RADIUS
         try:
-            motor.setVelocity(velocity)
+            self.__left_motor.setVelocity(left)
         except Exception:
             pass
-
-    def __redraw_path(self, path: list[tuple[float, float]]) -> None:
-        """Remove the previous path line and insert a new one into the scene tree.
-
-        This must only be called from step() (the Webots simulation thread).
-        """
-        line_def = f'PATH_LINE_{self.__robot_name}'
-
-        # Remove the previous line node if it exists.
         try:
-            old_node = self.__robot.getFromDef(line_def)
-            if old_node is not None:
-                old_node.remove()
+            self.__right_motor.setVelocity(right)
         except Exception:
             pass
-
-        if not path:
-            return
-
-        # Build the VRML coordinate string.
-        coord_parts = [f'{x:.4f} {y:.4f} 0.03' for x, y in path]
-        coord_str = ' '.join(coord_parts)
-        # coordIndex: 0 1 2 … N-1 -1  (single polyline, -1 terminates it)
-        index_str = ' '.join(str(i) for i in range(len(path))) + ' -1'
-
-        node_str = (
-            f'DEF {line_def} Transform {{ children [ '
-            f'Shape {{ '
-            f'appearance Appearance {{ material Material {{ diffuseColor 0 0.6 1 emissiveColor 0 0.3 0.5 }} }} '
-            f'geometry IndexedLineSet {{ '
-            f'coord Coordinate {{ point [ {coord_str} ] }} '
-            f'coordIndex [ {index_str} ] '
-            f'}} }} ] }}'
-        )
-
-        try:
-            root = self.__robot.getRoot()
-            children = root.getField('children')
-            children.importMFNodeFromString(-1, node_str)
-        except Exception as exc:
-            try:
-                self.__node.get_logger().warning(f'Path draw failed for {self.__robot_name}: {exc}')
-            except Exception:
-                pass
 
     def __set_task_color(self, task_id: str, r: float, g: float, b: float) -> None:
-        """Update the baseColor of a task marker DEF node in the Webots scene."""
         try:
-            def_name = f'TASK_{task_id}'
-            node = self.__robot.getFromDef(def_name)
+            node = self.__robot.getFromDef(f'TASK_{task_id}')
             if node is None:
                 return
-
-            children_field = node.getField('children')
-            if children_field is None:
+            children = node.getField('children')
+            if children is None:
                 return
-
-            try:
-                shape_node = children_field.getMFNode(0)
-            except Exception:
+            shape = children.getMFNode(0)
+            app_field = shape.getField('appearance')
+            if app_field is None:
                 return
-
-            appearance_field = shape_node.getField('appearance')
-            if appearance_field is None:
+            app_node = app_field.getSFNode()
+            color_field = app_node.getField('baseColor')
+            if color_field is None:
                 return
-
-            try:
-                app_node = appearance_field.getSFNode()
-            except Exception:
-                return
-
-            base_color_field = app_node.getField('baseColor')
-            if base_color_field is None:
-                return
-
-            base_color_field.setSFColor([r, g, b])
-        except Exception as exc:
-            try:
-                self.__node.get_logger().warning(f'Failed to set color for {task_id}: {exc}')
-            except Exception:
-                pass
+            color_field.setSFColor([r, g, b])
+        except Exception:
+            pass
