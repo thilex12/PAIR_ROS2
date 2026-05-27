@@ -75,6 +75,9 @@ class CbbaAgent(Node):
         self.declare_parameter('path_publish_interval', 0.6)
         self.declare_parameter('max_path_points', 50)
         self.declare_parameter('enable_path_visualization', True)
+        # Wall segments serialized as JSON by the launch file.
+        # Format: list of {x1, y1, x2, y2, thickness} dicts.
+        self.declare_parameter('walls_json', '[]')
 
         self.__robot_name = self.get_parameter('robot_name').get_parameter_value().string_value
         if not self.__robot_name:
@@ -104,8 +107,16 @@ class CbbaAgent(Node):
         self.__last_published_path: list[tuple[float, float]] | None = None
 
         self.__tasks = self.__load_tasks(tasks_config)
+
+        # Load static obstacles and walls from optional obstacles_config file.
         obstacles_config = self.get_parameter('obstacles_config').get_parameter_value().string_value
         self.__static_obstacles, self.__walls = self.__load_static_obstacles(obstacles_config)
+
+        # Load wall segments injected by the launch file (from robots.yaml arena_walls).
+        # These are the same walls rendered in Webots, so the A* planner now has
+        # full knowledge of them without any sensor-based mapping.
+        walls_json = self.get_parameter('walls_json').get_parameter_value().string_value
+        self.__walls = self.__walls + self.__parse_walls_json(walls_json)
 
         self.__pose: tuple[float, float, float] | None = None
         self.__left_range = float('inf')
@@ -129,6 +140,31 @@ class CbbaAgent(Node):
         self.__path_publisher = self.create_publisher(String, 'cbba_path', 10)
 
         self.create_timer(0.2, self.__timer_callback)
+
+        self.get_logger().info(
+            f'{self.__robot_name}: A* planner loaded {len(self.__walls)} wall segment(s).'
+        )
+
+    def __parse_walls_json(self, walls_json: str) -> list[WallSegment]:
+        """Parse the walls_json parameter into WallSegment objects.
+
+        The launch file serializes arena_walls from robots.yaml as a JSON list
+        of line-segment dicts: {x1, y1, x2, y2, thickness}.
+        """
+        segments: list[WallSegment] = []
+        try:
+            raw = json.loads(walls_json)
+            for entry in raw:
+                segments.append(WallSegment(
+                    x1=float(entry['x1']),
+                    y1=float(entry['y1']),
+                    x2=float(entry['x2']),
+                    y2=float(entry['y2']),
+                    thickness=float(entry.get('thickness', 0.04)),
+                ))
+        except Exception as exc:
+            self.get_logger().warning(f'Failed to parse walls_json: {exc}')
+        return segments
 
     def __load_tasks(self, tasks_config: str) -> list[Task]:
         if not tasks_config:
@@ -325,25 +361,34 @@ class CbbaAgent(Node):
         return _distance(px, py, qx, qy)
 
     def __cell_is_blocked(self, cx: int, cy: int, start_cell: tuple[int, int], goal_cell: tuple[int, int]) -> bool:
+        # Never block the start or goal cells, even if they are near a wall.
         if (cx, cy) == start_cell or (cx, cy) == goal_cell:
             return False
 
         wx, wy = self.__cell_to_world(cx, cy)
-        # outside arena
+
+        # Cells outside the arena boundary are always blocked.
         if math.hypot(wx, wy) > self.__arena_radius:
             return True
 
-        # static circular obstacles
+        # Static circular obstacles loaded from obstacles_config.
         for obs in self.__static_obstacles:
             if _distance(wx, wy, obs.x, obs.y) <= obs.radius + self.__path_resolution * 0.5:
                 return True
 
-        # walls
+        # Wall segments: combines both obstacles_config walls and arena_walls
+        # injected by the launch file.
+        # Clearance = half wall thickness + robot body radius (0.045 m) + safety margin (0.06 m).
+        # The safety margin ensures the A* path stays comfortably away from the
+        # wall surface so the robot never clips it during navigation.
+        _ROBOT_RADIUS = 0.045
+        _WALL_SAFETY_MARGIN = 0.06
         for w in self.__walls:
-            if self.__distance_to_segment(wx, wy, w.x1, w.y1, w.x2, w.y2) <= (w.thickness / 2.0) + self.__path_resolution * 0.5:
+            clearance = w.thickness / 2.0 + _ROBOT_RADIUS + _WALL_SAFETY_MARGIN
+            if self.__distance_to_segment(wx, wy, w.x1, w.y1, w.x2, w.y2) <= clearance:
                 return True
 
-        # dynamic robots
+        # Dynamic robot positions received from peer state messages.
         for peer_state in self.__peer_state.values():
             pose = peer_state.get('pose', {})
             try:
@@ -376,7 +421,7 @@ class CbbaAgent(Node):
             if current in closed:
                 continue
             if current == goal:
-                # reconstruct
+                # Reconstruct path from goal back to start.
                 path_cells = []
                 cur = current
                 while cur != start:
@@ -384,7 +429,7 @@ class CbbaAgent(Node):
                     cur = came_from[cur]
                 path_cells.reverse()
                 path = [self.__cell_to_world(px, py) for px, py in path_cells]
-                # ensure final precise goal appended
+                # Ensure the precise goal coordinates are the last waypoint.
                 if not path or _distance(path[-1][0], path[-1][1], gx, gy) > self.__path_resolution * 0.6:
                     path.append((gx, gy))
                 return path
@@ -402,7 +447,7 @@ class CbbaAgent(Node):
                     heuristic = math.hypot(goal[0] - nx, goal[1] - ny)
                     heapq.heappush(open_heap, (tentative_g + heuristic, nx, ny))
 
-        # failed: return straight line fallback
+        # A* failed to find a path: return a direct fallback waypoint.
         return [(gx, gy)]
 
     # -- CBBA core ----------------------------------------------------
@@ -518,11 +563,11 @@ class CbbaAgent(Node):
             self.__cmd_vel_publisher.publish(command_message)
             return
 
-        # compute path and publish it for visualization (throttled + trimmed)
+        # Compute A* path from current position to the target task.
         path = self.__astar_path(current_x, current_y, target_task.x, target_task.y)
-        # trim or downsample long paths
+
+        # Downsample long paths to stay within the max_path_points budget.
         if len(path) > self.__max_path_points:
-            # simple downsample: take evenly spaced samples including last
             step = max(1, len(path) // self.__max_path_points)
             trimmed = [path[i] for i in range(0, len(path), step)][:self.__max_path_points]
             if trimmed[-1] != path[-1]:
@@ -549,7 +594,7 @@ class CbbaAgent(Node):
             except Exception:
                 pass
 
-        # follow first path waypoint
+        # Steer toward the first waypoint on the planned path.
         nav_x, nav_y = path[0] if path else (target_task.x, target_task.y)
         heading = math.atan2(nav_y - current_y, nav_x - current_x)
         heading_error = _normalize_angle(heading - current_yaw)
@@ -559,6 +604,8 @@ class CbbaAgent(Node):
         linear_speed *= max(0.0, 1.0 - abs(heading_error) / math.pi)
         angular_speed = max(-self.__max_angular_speed, min(self.__max_angular_speed, self.__angular_gain * heading_error))
 
+        # Distance-sensor emergency stop: if an obstacle is too close, rotate in
+        # place away from it.  This is a last-resort reflex, not a mapping step.
         if self.__left_range < self.__clearance_threshold or self.__right_range < self.__clearance_threshold:
             command_message.linear.x = 0.0
             command_message.angular.z = -angular_speed if self.__left_range < self.__right_range else angular_speed

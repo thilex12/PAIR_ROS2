@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 from math import cos, sin, tau
@@ -320,6 +321,46 @@ def _build_arena_walls(walls_config):
     return walls
 
 
+def _walls_config_to_segments(walls_config: list) -> list[dict]:
+    """Convert box-shaped wall definitions (from robots.yaml) into line segments for A* path planning.
+
+    Each wall is defined as a box with a center position (x, y), width (along X axis)
+    and depth (along Y axis). We convert it into a segment (x1, y1) -> (x2, y2)
+    running along the long axis of the wall, with a thickness equal to the short axis.
+
+    Example:
+        x=0.25, y=0.0, width=0.04, depth=1.4
+        -> segment from (0.25, -0.7) to (0.25, +0.7) with thickness 0.04
+    """
+    segments = []
+    for wall in walls_config:
+        x = float(wall.get('x', 0.0))
+        y = float(wall.get('y', 0.0))
+        width = float(wall.get('width', 0.02))   # extent along X axis
+        depth = float(wall.get('depth', 0.50))   # extent along Y axis
+
+        if depth >= width:
+            # Wall is oriented along Y: segment runs from bottom to top center
+            segments.append({
+                'x1': x,
+                'y1': y - depth / 2.0,
+                'x2': x,
+                'y2': y + depth / 2.0,
+                'thickness': width,
+            })
+        else:
+            # Wall is oriented along X: segment runs from left to right center
+            segments.append({
+                'x1': x - width / 2.0,
+                'y1': y,
+                'x2': x + width / 2.0,
+                'y2': y,
+                'thickness': depth,
+            })
+
+    return segments
+
+
 def _generate_world_file(robot_names, task_markers, arena_radius, arena_walls):
     world_content = [WORLD_HEADER_TEMPLATE.substitute(arena_radius=f'{arena_radius:.6f}')]
     world_content.extend(arena_walls)
@@ -360,6 +401,10 @@ def generate_launch_description():
     arena_walls = _build_arena_walls(robot_config['arena_walls'])
     world_path = _generate_world_file(robot_names, task_markers, robot_config['arena_radius'], arena_walls)
 
+    # Convert wall boxes to line segments and serialize to JSON so each agent
+    # can load them directly into its A* planner without any file I/O.
+    walls_json = json.dumps(_walls_config_to_segments(robot_config['arena_walls']))
+
     webots = WebotsLauncher(
         world=world_path
     )
@@ -393,6 +438,9 @@ def generate_launch_description():
                         'max_angular_speed': robot_config['max_angular_speed'],
                         'enable_path_visualization': robot_config['display_paths'],
                         'arena_radius': robot_config['arena_radius'],
+                        # Pass wall segments as JSON so the agent can use them
+                        # in A* collision checks without needing a separate file.
+                        'walls_json': walls_json,
                     },
                 ],
             )
