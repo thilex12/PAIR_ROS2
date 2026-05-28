@@ -1,4 +1,5 @@
-# src\my_package\my_package\cbba_agent.py
+"""Agent CBBA qui assigne les taches et pilote le robot dans Webots."""
+
 import json
 import heapq
 import math
@@ -19,6 +20,8 @@ import yaml
 
 @dataclass(frozen=True)
 class Task:
+    """Tache lue depuis le fichier YAML des taches."""
+
     task_id: str
     x: float
     y: float
@@ -27,6 +30,8 @@ class Task:
 
 @dataclass(frozen=True)
 class StaticObstacle:
+    """Obstacle circulaire charge depuis la configuration optionnelle."""
+
     x: float
     y: float
     radius: float
@@ -34,6 +39,8 @@ class StaticObstacle:
 
 @dataclass(frozen=True)
 class WallSegment:
+    """Segment de mur utilise par le planificateur A* et les collisions."""
+
     x1: float
     y1: float
     x2: float
@@ -43,23 +50,33 @@ class WallSegment:
 
 @dataclass
 class WinnerEntry:
+    """Meilleure enchere connue pour une tache dans la table CBBA partagee."""
+
     robot: str
     score: float
 
 
 def _normalize_angle(angle: float) -> float:
+    """Ramene un angle dans l'intervalle [-pi, pi]."""
+
     return math.atan2(math.sin(angle), math.cos(angle))
 
 
 def _distance(x_0: float, y_0: float, x_1: float, y_1: float) -> float:
+    """Retourne la distance euclidienne entre deux points."""
+
     return math.hypot(x_1 - x_0, y_1 - y_0)
 
 
 class CbbaAgent(Node):
+    """Noeud ROS 2 qui propose des encheres, planifie les chemins et publie les commandes."""
+
     def __init__(self) -> None:
+        """Cree le noeud, charge les parametres et branche les interfaces ROS."""
+
         super().__init__('cbba_agent')
 
-        # parameters
+        # Parametres du noeud.
         self.declare_parameter('robot_name', '')
         self.declare_parameter('tasks_config', '')
         self.declare_parameter('bundle_size',3)
@@ -78,10 +95,9 @@ class CbbaAgent(Node):
         self.declare_parameter('enable_path_visualization', True)
         self.declare_parameter('walls_json', '[]')
         self.declare_parameter('robot_count', 1)
-        # Multiplier applied to travel cost in the bid score: score = reward - distance_weight * travel_cost.
-        # A value of 1.0 (default) means raw path length.
-        # Increase (e.g. 5.0–10.0) to make proximity dominate over reward differences,
-        # so the closest robot almost always wins regardless of reward magnitude.
+        # Multiplicateur applique au cout de trajet dans le score:
+        # score = reward - distance_weight * travel_cost.
+        # 1.0 laisse le cout brut. Une valeur plus grande favorise la proximite.
         self.declare_parameter('distance_weight', 5.0)
 
         self.__robot_name = self.get_parameter('robot_name').get_parameter_value().string_value
@@ -107,9 +123,8 @@ class CbbaAgent(Node):
         self.__path_publish_interval = max(0.0, self.get_parameter('path_publish_interval').get_parameter_value().double_value)
         self.__max_path_points = max(1, self.get_parameter('max_path_points').get_parameter_value().integer_value)
         self.__enable_path_visualization = self.get_parameter('enable_path_visualization').get_parameter_value().bool_value
-        # Total number of robots in the simulation (including self).
-        # Used to delay the first CBBA bid until all peers have been heard from,
-        # preventing spurious path displays before consensus is reached.
+        # Nombre total de robots dans la simulation, moi inclus.
+        # Sert a attendre les autres noeuds avant de lancer les premieres encheres.
         self.__robot_count = max(1, self.get_parameter('robot_count').get_parameter_value().integer_value)
         self.__distance_weight = max(0.1, self.get_parameter('distance_weight').get_parameter_value().double_value)
 
@@ -133,10 +148,8 @@ class CbbaAgent(Node):
         self.__winner_table: dict[str, WinnerEntry] = {}
         self.__peer_state: dict[str, dict[str, Any]] = {}
 
-        # Cache for A* path lengths used during bid scoring.
-        # Key: (from_x_cell, from_y_cell, to_x_cell, to_y_cell)
-        # Value: float path length in world units
-        # Cleared at the start of every __rebuild_bundle call.
+        # Cache des longueurs de chemin A* utilisees pour le calcul des scores.
+        # Cle: cellules de depart et d'arrivee. Vide a chaque reconstruction du bundle.
         self.__path_length_cache: dict[tuple[int, int, int, int], float] = {}
 
         # subscriptions
@@ -158,6 +171,8 @@ class CbbaAgent(Node):
         )
 
     def __parse_walls_json(self, walls_json: str) -> list[WallSegment]:
+        """Decode la configuration JSON des murs en segments exploitables par le planificateur."""
+
         segments: list[WallSegment] = []
         try:
             raw = json.loads(walls_json)
@@ -174,6 +189,8 @@ class CbbaAgent(Node):
         return segments
 
     def __load_tasks(self, tasks_config: str) -> list[Task]:
+        """Charge la liste des taches depuis le fichier YAML fourni en parametre."""
+
         if not tasks_config:
             return []
         config_path = Path(tasks_config)
@@ -193,6 +210,8 @@ class CbbaAgent(Node):
         return tasks
 
     def __load_static_obstacles(self, obstacles_config: str) -> tuple[list[StaticObstacle], list[WallSegment]]:
+        """Charge les obstacles statiques et les murs depuis le fichier YAML optionnel."""
+
         if not obstacles_config:
             return [], []
         config_path = Path(obstacles_config)
@@ -220,18 +239,26 @@ class CbbaAgent(Node):
         return obstacles, walls
 
     def __pose_callback(self, message: PoseStamped) -> None:
+        """Met a jour la pose courante du robot a partir du topic pose."""
+
         quaternion_z = message.pose.orientation.z
         quaternion_w = message.pose.orientation.w
         yaw = math.atan2(2.0 * quaternion_w * quaternion_z, 1.0 - 2.0 * quaternion_z * quaternion_z)
         self.__pose = (message.pose.position.x, message.pose.position.y, yaw)
 
     def __left_sensor_callback(self, message: Range) -> None:
+        """Met a jour la distance mesuree a gauche."""
+
         self.__left_range = message.range
 
     def __right_sensor_callback(self, message: Range) -> None:
+        """Met a jour la distance mesuree a droite."""
+
         self.__right_range = message.range
 
     def __state_callback(self, message: String) -> None:
+        """Stocke l'etat CBBA recu d'un autre robot."""
+
         try:
             payload = json.loads(message.data)
         except json.JSONDecodeError:
@@ -242,22 +269,23 @@ class CbbaAgent(Node):
         self.__peer_state[sender] = payload
 
     def __peers_ready(self) -> bool:
-        """Return True once we have heard from every other robot at least once.
+        """Vrai quand tous les autres robots ont deja ete entendus au moins une fois.
 
-        With robot_count == 1 there are no peers, so we are always ready.
-        This prevents the agent from bidding (and drawing a path) before CBBA
-        consensus can even start, which was causing the spurious early path display.
+        Si robot_count vaut 1, il n'y a aucun pair et le noeud peut agir tout de suite.
+        Cela evite de lancer les encheres avant que CBBA puisse vraiment converger.
         """
         expected_peers = self.__robot_count - 1
         return len(self.__peer_state) >= expected_peers
 
     def __timer_callback(self) -> None:
+        """Boucle principale periodique du noeud CBBA."""
+
         if self.__pose is None or not self.__tasks:
             self.__publish_idle_state()
             return
 
-        # Publish our state every tick so peers can discover us quickly,
-        # but don't bid or navigate until all peers have checked in.
+        # Publie notre etat a chaque cycle pour etre detecte vite par les autres noeuds.
+        # On ne lance les encheres qu'apres avoir recu les pairs.
         self.__publish_state()
 
         if not self.__peers_ready():
@@ -278,6 +306,8 @@ class CbbaAgent(Node):
         self.__publish_assignment_summary()
 
     def __merge_peer_winners(self) -> None:
+        """Integre les meilleures encheres recues des autres robots."""
+
         for peer_state in self.__peer_state.values():
             peer_winners = peer_state.get('winner_table', {})
             for task_id, winner_data in peer_winners.items():
@@ -292,6 +322,8 @@ class CbbaAgent(Node):
                     self.__winner_table[task_id] = peer_entry
 
     def __merge_peer_completions(self) -> None:
+        """Integre les taches deja terminees par les autres robots."""
+
         peer_completed_tasks: set[str] = set()
         for peer_state in self.__peer_state.values():
             peer_completed_tasks.update(str(task_id) for task_id in peer_state.get('completed_tasks', []))
@@ -305,6 +337,8 @@ class CbbaAgent(Node):
                 self.__bundle.remove(task_id)
 
     def __all_tasks_completed(self) -> bool:
+        """Vrai si toutes les taches connues sont deja terminees par l'equipe."""
+
         if not self.__tasks:
             return True
         completed_task_ids = set(self.__completed_tasks)
@@ -313,6 +347,8 @@ class CbbaAgent(Node):
         return all(task.task_id in completed_task_ids for task in self.__tasks)
 
     def __abandon_from_task(self, task_id: str, winning_peer: WinnerEntry | None = None) -> None:
+        """Abandonne la tache courante et toutes celles qui suivent dans le bundle."""
+
         if task_id not in self.__bundle:
             return
         abandon_index = self.__bundle.index(task_id)
@@ -333,6 +369,8 @@ class CbbaAgent(Node):
             self.get_logger().info(f'Robot {self.__robot_name} abandons task {task_id}')
 
     def __is_better_winner(self, candidate: WinnerEntry, incumbent: WinnerEntry) -> bool:
+        """Compare deux encheres: le score le plus eleve gagne, puis le nom du robot."""
+
         if candidate.score != incumbent.score:
             return candidate.score > incumbent.score
         return candidate.robot < incumbent.robot
@@ -340,12 +378,18 @@ class CbbaAgent(Node):
     # -- A* utilities -------------------------------------------------
 
     def __world_to_cell(self, x: float, y: float) -> tuple[int, int]:
+        """Convertit une position monde en cellule de grille."""
+
         return (int(round(x / self.__path_resolution)), int(round(y / self.__path_resolution)))
 
     def __cell_to_world(self, cx: int, cy: int) -> tuple[float, float]:
+        """Convertit une cellule de grille en coordonnees monde."""
+
         return (cx * self.__path_resolution, cy * self.__path_resolution)
 
     def __distance_to_segment(self, px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> float:
+        """Calcule la distance d'un point a un segment de droite."""
+
         dx = x2 - x1
         dy = y2 - y1
         if dx == 0 and dy == 0:
@@ -357,11 +401,10 @@ class CbbaAgent(Node):
         return _distance(px, py, qx, qy)
 
     def __cell_is_blocked_static(self, cx: int, cy: int, start_cell: tuple[int, int], goal_cell: tuple[int, int]) -> bool:
-        """Check only static obstacles (arena boundary, circular obstacles, walls).
+        """Verifie seulement les obstacles fixes: bord de l'arene, obstacles, murs.
 
-        Used by __astar_path_length during CBBA bid scoring so that peer robot
-        positions — which change every tick — do not pollute the cached cost
-        estimates and cause unstable bid oscillations.
+        Utilise pour le cout A* afin que les positions des autres robots ne
+        perturbent pas le cache de couts pendant le calcul des encheres.
         """
         if (cx, cy) == start_cell or (cx, cy) == goal_cell:
             return False
@@ -380,7 +423,7 @@ class CbbaAgent(Node):
         return False
 
     def __cell_is_blocked(self, cx: int, cy: int, start_cell: tuple[int, int], goal_cell: tuple[int, int]) -> bool:
-        """Full check including dynamic peer positions. Used during navigation."""
+        """Verifie les obstacles fixes et les autres robots pendant la navigation."""
         if self.__cell_is_blocked_static(cx, cy, start_cell, goal_cell):
             return True
         for peer_state in self.__peer_state.values():
@@ -396,6 +439,8 @@ class CbbaAgent(Node):
         return False
 
     def __astar_path(self, sx: float, sy: float, gx: float, gy: float, static_only: bool = False) -> list[tuple[float, float]]:
+        """Calcule un chemin A* entre deux points en tenant compte de la grille."""
+
         start = self.__world_to_cell(sx, sy)
         goal = self.__world_to_cell(gx, gy)
         if start == goal:
@@ -442,13 +487,11 @@ class CbbaAgent(Node):
         return [(gx, gy)]
 
     def __astar_path_length(self, sx: float, sy: float, gx: float, gy: float) -> float:
-        """Return the A* path length in world units, with per-rebuild caching.
+        """Retourne la longueur du chemin A* en metres, avec un cache par reconstruction.
 
-        The cache key is based on grid cells so nearby positions hash to the
-        same entry and avoid redundant searches.  Peer-robot positions are NOT
-        included in the key — they change every timer tick but we only need a
-        stable cost estimate for the bid; the actual navigation path is
-        recomputed fresh in __publish_command.
+        La cle du cache repose sur les cellules de grille pour eviter de relancer
+        un A* identique plusieurs fois. Les autres robots ne sont pas inclus dans
+        la cle, car ce cout sert surtout au calcul de l'enchere.
         """
         sc = self.__world_to_cell(sx, sy)
         gc = self.__world_to_cell(gx, gy)
@@ -459,7 +502,7 @@ class CbbaAgent(Node):
 
         path = self.__astar_path(sx, sy, gx, gy, static_only=True)
 
-        # Sum Euclidean distances between consecutive waypoints.
+        # Somme des distances euclidiennes entre les points successifs.
         length = 0.0
         prev = (sx, sy)
         for wp in path:
@@ -470,13 +513,13 @@ class CbbaAgent(Node):
         is_fallback = len(path) == 1 and path[0] == (gx, gy)
         penalised = False
 
-        # If A* only returned the goal (fallback), use straight-line distance
-        # but apply a large penalty so robots behind walls bid less.
+        # Si A* ne renvoie que la cible, on applique une penalite pour limiter
+        # les robots bloques derriere un mur.
         if is_fallback:
             if length > euclidean * 1.05:
-                pass  # genuine detour path (shouldn't happen with fallback, but be safe)
+                pass  # vrai detour, cas rare mais permis.
             else:
-                # Fallback: penalise heavily to discourage the blocked robot
+                # Cas de repli: penalite forte pour decourager le robot bloque.
                 length = euclidean * 3.0
                 penalised = True
 
@@ -487,9 +530,9 @@ class CbbaAgent(Node):
         )
         if penalised:
             self.get_logger().warn(
-                f'[A* PENALTY] {self.__robot_name}: no path found from '
+                f'[PENALITE A*] {self.__robot_name}: aucun chemin trouve depuis '
                 f'({sx:.2f},{sy:.2f}) to ({gx:.2f},{gy:.2f}) — '
-                f'applying x3 penalty (eucl={euclidean:.3f} -> cost={length:.3f})'
+                f'application d\'une penalite x3 (eucl={euclidean:.3f} -> cout={length:.3f})'
             )
 
         self.__path_length_cache[cache_key] = length
@@ -498,8 +541,7 @@ class CbbaAgent(Node):
     # -- CBBA core ----------------------------------------------------
 
     def __rebuild_bundle(self) -> None:
-        # Clear the path-length cache at the start of each rebuild so costs
-        # reflect the current world state (completed tasks, peer positions).
+        # Vide le cache de longueurs de chemin a chaque reconstruction du bundle.
         self.__path_length_cache.clear()
 
         bundle_before = list(self.__bundle)
@@ -543,7 +585,7 @@ class CbbaAgent(Node):
             current_y = selected_task.y
 
         if self.__bundle != bundle_before:
-            # Log the full bundle with per-task travel cost + score breakdown.
+            # Journalise le bundle complet avec le cout et le score de chaque tache.
             cx, cy, _ = self.__pose
             parts = []
             for tid in self.__bundle:
@@ -551,11 +593,11 @@ class CbbaAgent(Node):
                 cost = self.__astar_path_length(cx, cy, t.x, t.y)
                 score = t.reward - self.__distance_weight * cost
                 penalised = ''
-                # Re-detect fallback to flag it in the log.
+                # Recalcule le cas de repli pour le signaler dans le journal.
                 raw_path = self.__astar_path(cx, cy, t.x, t.y, static_only=True)
                 eucl = _distance(cx, cy, t.x, t.y)
                 if len(raw_path) == 1 and raw_path[0] == (t.x, t.y) and cost >= eucl * 2.9:
-                    penalised = ' [PENALISED]'
+                    penalised = ' [PENALISE]'
                 parts.append('%s(cost=%.2f score=%.2f%s)' % (tid, cost, score, penalised))
                 cx, cy = t.x, t.y
             self.get_logger().info(
@@ -563,23 +605,25 @@ class CbbaAgent(Node):
             )
 
     def __score_for_task(self, task: Task, from_x: float, from_y: float) -> float:
-        """Score = reward - distance_weight * A*_travel_cost.
+        """Calcule le score d'une tache: reward - distance_weight * cout de trajet.
 
-        distance_weight > 1 makes proximity dominate over reward differences,
-        ensuring the closest robot wins even when rewards vary significantly.
-        Default is 5.0 so a 1m difference in path length outweighs a 2-point
-        reward difference on the typical arena scale.
+        Une valeur elevee de distance_weight fait davantage compter la proximite
+        que la recompense brute.
         """
         travel_cost = self.__astar_path_length(from_x, from_y, task.x, task.y)
         return task.reward - self.__distance_weight * travel_cost
 
     def __task_by_id(self, task_id: str) -> Task:
+        """Retourne l'objet tache correspondant a son identifiant."""
+
         for task in self.__tasks:
             if task.task_id == task_id:
                 return task
         raise KeyError(task_id)
 
     def __publish_state(self) -> None:
+        """Publie l'etat local CBBA pour les autres robots."""
+
         assert self.__pose is not None
         payload = {
             'robot_name': self.__robot_name,
@@ -601,6 +645,8 @@ class CbbaAgent(Node):
         self.__state_publisher.publish(message)
 
     def __publish_assignment_summary(self) -> None:
+        """Publie un resume simple des taches actuellement assignees."""
+
         assigned_tasks = {task_id: winner.robot for task_id, winner in self.__winner_table.items()}
         payload = {
             'robot_name': self.__robot_name,
@@ -614,10 +660,13 @@ class CbbaAgent(Node):
         self.__assignment_publisher.publish(message)
 
     def __publish_idle_state(self) -> None:
+        """Envoie une commande nulle pour laisser le robot immobile."""
+
         self.__cmd_vel_publisher.publish(Twist())
 
     def __clear_path_visualization(self) -> None:
-        """Publish an empty path so the driver parks all spheres back at y=999."""
+        """Publie un chemin vide pour ranger les spheres de visualisation."""
+
         if not self.__enable_path_visualization:
             return
         payload = {'robot_name': self.__robot_name, 'task_id': '', 'path': []}
@@ -627,6 +676,8 @@ class CbbaAgent(Node):
         self.__last_published_path = None
 
     def __publish_command(self) -> None:
+        """Calcule et publie la commande de mouvement vers la tache courante."""
+
         command_message = Twist()
         if not self.__bundle:
             self.__cmd_vel_publisher.publish(command_message)
@@ -693,6 +744,8 @@ class CbbaAgent(Node):
 
 
 def main(args: list[str] | None = None) -> None:
+    """Run the CBBA agent until shutdown."""
+
     rclpy.init(args=args)
     node = CbbaAgent()
     try:

@@ -1,3 +1,5 @@
+"""Eviteur d'obstacles reactif simple pour la simulation TurtleBot."""
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Range
@@ -8,7 +10,11 @@ MAX_RANGE = 0.15
 
 
 class ObstacleAvoider(Node):
+    """Avance et tourne lorsque l'un des capteurs avant detecte un obstacle."""
+
     def __init__(self):
+        """Installe les abonnements aux capteurs et le publish de vitesse."""
+
         super().__init__('obstacle_avoider')
 
         self.__left_sensor_value = MAX_RANGE
@@ -20,14 +26,20 @@ class ObstacleAvoider(Node):
         self.create_subscription(Range, 'right_sensor', self.__right_sensor_callback, 1)
 
     def __left_sensor_callback(self, message):
+        """Stocke la derniere mesure du capteur gauche et recalcule la commande."""
+
         self.__left_sensor_value = message.range
         self.__publish_command()
 
     def __right_sensor_callback(self, message):
+        """Stocke la derniere mesure du capteur droit et recalcule la commande."""
+
         self.__right_sensor_value = message.range
         self.__publish_command()
 
     def __publish_command(self):
+        """Publie une commande simple en avant avec rotation si un obstacle est proche."""
+
         command_message = Twist()
 
         command_message.linear.x = 0.1
@@ -39,12 +51,13 @@ class ObstacleAvoider(Node):
 
 
 def main(args=None):
+    """Lance le noeud d'evitement d'obstacles."""
+
     rclpy.init(args=args)
     avoider = ObstacleAvoider()
     rclpy.spin(avoider)
-    # Destroy the node explicitly
-    # (optional - otherwise it will be done automatically
-    # when the garbage collector destroys the node object)
+    # Destruction explicite du noeud.
+    # Sinon, Python le liberera automatiquement plus tard.
     avoider.destroy_node()
     rclpy.shutdown()
 

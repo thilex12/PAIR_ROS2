@@ -1,3 +1,5 @@
+"""Controleur Webots qui relie les commandes ROS au robot simule."""
+
 import json
 import math
 import time
@@ -22,7 +24,11 @@ HIDDEN_POS = [0.0, 999.0, 0.0]
 
 
 class MyRobotDriver:
+    """Driver Webots qui publie la pose, pilote les roues et affiche le chemin."""
+
     def init(self, webots_node, properties):
+        """Initialise les peripheriques Webots et les abonnements ROS."""
+
         self.__robot = webots_node.robot
         self.__robot_node = self.__robot.getSelf()
         self.__robot_name = self.__robot.getName()
@@ -51,7 +57,7 @@ class MyRobotDriver:
         self.__cbba_inprogress: set = set()
         self.__cbba_known_tasks: set = set()
 
-        # Path visualisation state.
+        # Etat de la visualisation du chemin.
         self.__pending_path: list | None = None
         self.__path_dirty: bool = False
         self.__drawn_path: list | None = None
@@ -60,14 +66,14 @@ class MyRobotDriver:
         self.__sphere_translation_fields: list = []
 
     # -------------------------------------------------------------------------
-    # ROS callbacks — must NOT touch Webots APIs
+    # Callbacks ROS: ils ne doivent pas appeler les API Webots.
     # -------------------------------------------------------------------------
 
     def __cmd_vel_callback(self, twist: Twist) -> None:
         self.__target_twist = twist
 
     def __path_callback(self, message: String) -> None:
-        """Buffer the latest path for drawing in step(); never touch Webots here."""
+        """Met en tampon le dernier chemin recu pour le dessiner dans step()."""
         try:
             payload = json.loads(message.data)
         except Exception:
@@ -85,8 +91,8 @@ class MyRobotDriver:
             except Exception:
                 continue
 
-        # Allow empty path through — it signals that all spheres should be parked.
-        # Downsample to sphere budget only for non-empty paths.
+        # Un chemin vide signifie qu'il faut ranger toutes les spheres.
+        # On reduit le nombre de points seulement pour les chemins non vides.
         if clean and len(clean) > PATH_SPHERE_COUNT:
             step = max(1, len(clean) // PATH_SPHERE_COUNT)
             downsampled = [clean[i] for i in range(0, len(clean), step)]
@@ -95,12 +101,14 @@ class MyRobotDriver:
             clean = downsampled[:PATH_SPHERE_COUNT]
 
         if clean == self.__drawn_path:
-            return  # nothing changed, skip redraw
+            return  # Rien a changer, on saute le redraw.
 
         self.__pending_path = clean
         self.__path_dirty = True
 
     def __cbba_state_callback(self, message: String) -> None:
+        """Met a jour l'etat CBBA local a partir du message partage."""
+
         try:
             payload = json.loads(message.data)
         except Exception:
@@ -124,10 +132,12 @@ class MyRobotDriver:
                 self.__set_task_color(task_id, 0.85, 0.15, 0.15)
 
     # -------------------------------------------------------------------------
-    # Webots step — the only place that may call Webots APIs
+    # Boucle Webots: seul endroit ou les API Webots peuvent etre appelees.
     # -------------------------------------------------------------------------
 
     def step(self) -> None:
+        """Avance d'un pas Webots et traite les mises a jour ROS en attente."""
+
         try:
             rclpy.spin_once(self.__node, timeout_sec=0)
             self.__publish_pose()
@@ -155,10 +165,12 @@ class MyRobotDriver:
                 pass
 
     # -------------------------------------------------------------------------
-    # Internal helpers — all Webots API calls live here
+    # Aides internes: tous les appels Webots sont regroupes ici.
     # -------------------------------------------------------------------------
 
     def __cache_sphere_fields(self) -> None:
+        """Recupere et met en cache les champs translation des spheres de chemin."""
+
         fields = []
         for i in range(PATH_SPHERE_COUNT):
             def_name = f'PATH_{self.__robot_name}_{i}'
@@ -173,7 +185,7 @@ class MyRobotDriver:
         self.__sphere_translation_fields = fields
 
     def __redraw_path(self, path: list) -> None:
-        """Move pre-allocated spheres to path positions; park unused ones."""
+        """Deplace les spheres pre-allouees sur le chemin et gare les autres."""
         fields = self.__sphere_translation_fields
         if not fields:
             return
@@ -189,6 +201,8 @@ class MyRobotDriver:
                 pass
 
     def __publish_pose(self) -> None:
+        """Publie la pose estimee du robot dans le repere map."""
+
         try:
             msg = PoseStamped()
             msg.header.stamp = self.__node.get_clock().now().to_msg()
@@ -209,6 +223,8 @@ class MyRobotDriver:
             pass
 
     def __apply_motors(self) -> None:
+        """Convertit la consigne Twist en vitesses de roues gauche et droite."""
+
         fwd = self.__target_twist.linear.x
         ang = self.__target_twist.angular.z
         left = (fwd - ang * HALF_DISTANCE_BETWEEN_WHEELS) / WHEEL_RADIUS
@@ -223,6 +239,8 @@ class MyRobotDriver:
             pass
 
     def __set_task_color(self, task_id: str, r: float, g: float, b: float) -> None:
+        """Change la couleur d'une tache dans la scene Webots."""
+
         try:
             node = self.__robot.getFromDef(f'TASK_{task_id}')
             if node is None:

@@ -1,4 +1,5 @@
-# src\my_package\launch\cbba_launch.py
+"""Lance la simulation Webots multi-robot avec allocation de taches CBBA."""
+
 import json
 import os
 import tempfile
@@ -19,7 +20,7 @@ ROBOT_NAME_PREFIX = 'auto_robot_'
 
 PATH_SPHERE_COUNT = 40
 
-# One colour per robot — used for both the robot body and its path spheres.
+# Une couleur par robot, utilisee pour le corps et les spheres du chemin.
 ROBOT_COLORS = [
     [0, 0, 1],
     [0, 1, 0],
@@ -265,6 +266,8 @@ ROBOT_TEMPLATE = Template("""Robot {
 
 
 def _load_robot_configuration(package_dir):
+    """Charge la configuration robot depuis le YAML du package source ou installe."""
+
     source_config_path = Path(package_dir).resolve().parents[3] / 'src' / 'my_package' / 'config' / 'robots.yaml'
     installed_config_path = Path(package_dir) / 'config' / 'robots.yaml'
     config_path = source_config_path if source_config_path.exists() else installed_config_path
@@ -290,6 +293,8 @@ def _load_robot_configuration(package_dir):
 
 
 def _load_cbba_config(tasks_config_path: str) -> dict:
+    """Charge la configuration specifique a CBBA depuis le fichier des taches."""
+
     if not os.path.exists(tasks_config_path):
         return {}
     with open(tasks_config_path, 'r', encoding='utf-8') as f:
@@ -300,10 +305,14 @@ def _load_cbba_config(tasks_config_path: str) -> dict:
 
 
 def _build_robot_names(robot_count):
+    """Construit les noms de robots auto_robot_1, auto_robot_2, etc."""
+
     return [f'{ROBOT_NAME_PREFIX}{i + 1}' for i in range(robot_count)]
 
 
 def _build_robot_pose(index, robot_count, arena_radius):
+    """Place les robots sur un cercle autour de l'origine."""
+
     if robot_count == 1:
         return 0.0, 0.0, 0.0
     pose_radius = min(arena_radius * 0.75, max(0.35, 0.18 * robot_count))
@@ -312,6 +321,8 @@ def _build_robot_pose(index, robot_count, arena_radius):
 
 
 def _load_task_markers(tasks_config_path):
+    """Transforme les taches YAML en marqueurs visuels Webots."""
+
     if not os.path.exists(tasks_config_path):
         return []
     with open(tasks_config_path, 'r', encoding='utf-8') as f:
@@ -328,6 +339,8 @@ def _load_task_markers(tasks_config_path):
 
 
 def _build_arena_walls(walls_config):
+    """Construit les murs de l'arene en texte VRML."""
+
     walls = []
     for wall in walls_config:
         x = float(wall.get('x', 0.0))
@@ -347,7 +360,7 @@ def _build_arena_walls(walls_config):
 
 
 def _walls_config_to_segments(walls_config: list) -> list:
-    """Convert box-shaped wall definitions into line segments for the A* planner."""
+    """Convertit les murs en boites en segments utilises par le planificateur A*."""
     segments = []
     for wall in walls_config:
         x = float(wall.get('x', 0.0))
@@ -364,7 +377,7 @@ def _walls_config_to_segments(walls_config: list) -> list:
 
 
 def _build_path_spheres(robot_names: list, display_paths: bool) -> list:
-    """Pre-allocate waypoint spheres for each robot, using the same colour as the robot body."""
+    """Pre-alloue les spheres de chemin pour chaque robot avec la meme couleur."""
     if not display_paths:
         return []
 
@@ -380,6 +393,8 @@ def _build_path_spheres(robot_names: list, display_paths: bool) -> list:
 
 
 def _generate_world_file(robot_names, task_markers, arena_radius, arena_walls, path_spheres):
+    """Genere le fichier monde Webots temporaire pour cette simulation."""
+
     world_content = [WORLD_HEADER_TEMPLATE.substitute(arena_radius=f'{arena_radius:.6f}')]
     world_content.extend(arena_walls)
     world_content.extend(task_markers)
@@ -405,6 +420,8 @@ def _generate_world_file(robot_names, task_markers, arena_radius, arena_walls, p
     return world_path
 
 def generate_launch_description():
+    """Construit la description de lancement pour Webots, les robots et les noeuds CBBA."""
+
     package_dir = get_package_share_directory('my_package')
     robot_description_path = os.path.join(package_dir, 'resource', 'my_robot.urdf')
     tasks_config_path = os.path.join(package_dir, 'config', 'cbba_tasks.yaml')

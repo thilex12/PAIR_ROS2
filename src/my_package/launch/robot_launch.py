@@ -1,4 +1,5 @@
-# src\my_package\launch\robot_launch.py
+"""Lance la simulation Webots plus simple avec l'eviteur d'obstacles reactif."""
+
 import os
 import tempfile
 from math import cos, sin, tau
@@ -175,6 +176,8 @@ ROBOT_TEMPLATE = Template('''Robot {
 
 
 def _load_robot_configuration(package_dir):
+    """Charge le nombre de robots depuis la configuration du package."""
+
     source_config_path = Path(package_dir).resolve().parents[3] / 'src' / 'my_package' / 'config' / 'robots.yaml'
     installed_config_path = Path(package_dir) / 'config' / 'robots.yaml'
 
@@ -190,10 +193,14 @@ def _load_robot_configuration(package_dir):
 
 
 def _build_robot_names(robot_count):
+    """Construit les noms des robots de la simulation."""
+
     return [f'{ROBOT_NAME_PREFIX}{index + 1}' for index in range(robot_count)]
 
 
 def _build_robot_pose(index, robot_count):
+    """Place les robots sur un cercle autour du centre de l'arene."""
+
     if robot_count == 1:
         return 0.0, 0.0, 0.0
 
@@ -206,6 +213,8 @@ def _build_robot_pose(index, robot_count):
 
 
 def _generate_world_file(robot_names):
+    """Genere le fichier monde temporaire contenant les robots Webots."""
+
     world_content = [WORLD_HEADER]
 
     for index, robot_name in enumerate(robot_names):
@@ -232,6 +241,8 @@ def _generate_world_file(robot_names):
 
 
 def generate_launch_description():
+    """Construit la description de lancement pour Webots et les noeuds d'evitement."""
+
     package_dir = get_package_share_directory('my_package')
     robot_description_path = os.path.join(package_dir, 'resource', 'my_robot.urdf')
     robot_count = _load_robot_configuration(package_dir)
