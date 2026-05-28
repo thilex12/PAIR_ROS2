@@ -1,5 +1,5 @@
 # src\my_package\config\robots.yaml
-robot_count: 15
+robot_count: 6
 arena_radius: 2.0
 arena_walls:
   # Main vertical divider — splits arena into left and right zones.

@@ -1,3 +1,4 @@
+# src\my_package\launch\cbba_launch.py
 import json
 import os
 import tempfile
@@ -284,6 +285,17 @@ def _load_robot_configuration(package_dir):
         'max_angular_speed': float(configuration.get('max_angular_speed', 2.0)),
         'arena_radius': arena_radius,
         'arena_walls': configuration.get('arena_walls', []),
+        'distance_weight': float(configuration.get('distance_weight', 5.0)),
+    }
+
+
+def _load_cbba_config(tasks_config_path: str) -> dict:
+    if not os.path.exists(tasks_config_path):
+        return {}
+    with open(tasks_config_path, 'r', encoding='utf-8') as f:
+        configuration = yaml.safe_load(f) or {}
+    return {
+        'bundle_size': max(1, int(configuration.get('bundle_size', 2))),
     }
 
 
@@ -392,11 +404,11 @@ def _generate_world_file(robot_names, task_markers, arena_radius, arena_walls, p
         f.write('\n'.join(world_content))
     return world_path
 
-
 def generate_launch_description():
     package_dir = get_package_share_directory('my_package')
     robot_description_path = os.path.join(package_dir, 'resource', 'my_robot.urdf')
     tasks_config_path = os.path.join(package_dir, 'config', 'cbba_tasks.yaml')
+    cbba_config = _load_cbba_config(tasks_config_path)
     robot_config = _load_robot_configuration(package_dir)
     robot_count = robot_config['robot_count']
     display_paths = robot_config['display_paths']
@@ -427,11 +439,14 @@ def generate_launch_description():
             parameters=[{
                 'robot_name': robot_name,
                 'tasks_config': tasks_config_path,
+                'bundle_size': cbba_config.get('bundle_size', 2),
                 'max_linear_speed': robot_config['max_linear_speed'],
                 'max_angular_speed': robot_config['max_angular_speed'],
                 'enable_path_visualization': display_paths,
                 'arena_radius': robot_config['arena_radius'],
                 'walls_json': walls_json,
+                'robot_count': robot_count,
+                'distance_weight': float(robot_config.get('distance_weight', 5.0)),
             }],
         ))
 

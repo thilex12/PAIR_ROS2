@@ -1,4 +1,5 @@
-bundle_size: 2
+# src\my_package\config\cbba_tasks.yaml
+bundle_size: 1
 tasks:
   - id: inspect_a
     x: 0.35

@@ -1,3 +1,4 @@
+# src\my_package\my_package\cbba_agent.py
 import json
 import heapq
 import math
@@ -61,7 +62,7 @@ class CbbaAgent(Node):
         # parameters
         self.declare_parameter('robot_name', '')
         self.declare_parameter('tasks_config', '')
-        self.declare_parameter('bundle_size', 2)
+        self.declare_parameter('bundle_size',3)
         self.declare_parameter('goal_tolerance', 0.08)
         self.declare_parameter('max_linear_speed', 0.12)
         self.declare_parameter('max_angular_speed', 2.0)
@@ -76,6 +77,12 @@ class CbbaAgent(Node):
         self.declare_parameter('max_path_points', 50)
         self.declare_parameter('enable_path_visualization', True)
         self.declare_parameter('walls_json', '[]')
+        self.declare_parameter('robot_count', 1)
+        # Multiplier applied to travel cost in the bid score: score = reward - distance_weight * travel_cost.
+        # A value of 1.0 (default) means raw path length.
+        # Increase (e.g. 5.0–10.0) to make proximity dominate over reward differences,
+        # so the closest robot almost always wins regardless of reward magnitude.
+        self.declare_parameter('distance_weight', 5.0)
 
         self.__robot_name = self.get_parameter('robot_name').get_parameter_value().string_value
         if not self.__robot_name:
@@ -100,6 +107,11 @@ class CbbaAgent(Node):
         self.__path_publish_interval = max(0.0, self.get_parameter('path_publish_interval').get_parameter_value().double_value)
         self.__max_path_points = max(1, self.get_parameter('max_path_points').get_parameter_value().integer_value)
         self.__enable_path_visualization = self.get_parameter('enable_path_visualization').get_parameter_value().bool_value
+        # Total number of robots in the simulation (including self).
+        # Used to delay the first CBBA bid until all peers have been heard from,
+        # preventing spurious path displays before consensus is reached.
+        self.__robot_count = max(1, self.get_parameter('robot_count').get_parameter_value().integer_value)
+        self.__distance_weight = max(0.1, self.get_parameter('distance_weight').get_parameter_value().double_value)
 
         self.__last_path_pub_time = 0.0
         self.__last_published_path: list[tuple[float, float]] | None = None
@@ -229,10 +241,29 @@ class CbbaAgent(Node):
             return
         self.__peer_state[sender] = payload
 
+    def __peers_ready(self) -> bool:
+        """Return True once we have heard from every other robot at least once.
+
+        With robot_count == 1 there are no peers, so we are always ready.
+        This prevents the agent from bidding (and drawing a path) before CBBA
+        consensus can even start, which was causing the spurious early path display.
+        """
+        expected_peers = self.__robot_count - 1
+        return len(self.__peer_state) >= expected_peers
+
     def __timer_callback(self) -> None:
         if self.__pose is None or not self.__tasks:
             self.__publish_idle_state()
             return
+
+        # Publish our state every tick so peers can discover us quickly,
+        # but don't bid or navigate until all peers have checked in.
+        self.__publish_state()
+
+        if not self.__peers_ready():
+            self.__publish_idle_state()
+            return
+
         self.__merge_peer_winners()
         self.__merge_peer_completions()
         if self.__all_tasks_completed():
@@ -325,7 +356,13 @@ class CbbaAgent(Node):
         qy = y1 + t * dy
         return _distance(px, py, qx, qy)
 
-    def __cell_is_blocked(self, cx: int, cy: int, start_cell: tuple[int, int], goal_cell: tuple[int, int]) -> bool:
+    def __cell_is_blocked_static(self, cx: int, cy: int, start_cell: tuple[int, int], goal_cell: tuple[int, int]) -> bool:
+        """Check only static obstacles (arena boundary, circular obstacles, walls).
+
+        Used by __astar_path_length during CBBA bid scoring so that peer robot
+        positions — which change every tick — do not pollute the cached cost
+        estimates and cause unstable bid oscillations.
+        """
         if (cx, cy) == start_cell or (cx, cy) == goal_cell:
             return False
         wx, wy = self.__cell_to_world(cx, cy)
@@ -340,6 +377,12 @@ class CbbaAgent(Node):
             clearance = w.thickness / 2.0 + _ROBOT_RADIUS + _WALL_SAFETY_MARGIN
             if self.__distance_to_segment(wx, wy, w.x1, w.y1, w.x2, w.y2) <= clearance:
                 return True
+        return False
+
+    def __cell_is_blocked(self, cx: int, cy: int, start_cell: tuple[int, int], goal_cell: tuple[int, int]) -> bool:
+        """Full check including dynamic peer positions. Used during navigation."""
+        if self.__cell_is_blocked_static(cx, cy, start_cell, goal_cell):
+            return True
         for peer_state in self.__peer_state.values():
             pose = peer_state.get('pose', {})
             try:
@@ -347,15 +390,18 @@ class CbbaAgent(Node):
                 py = float(pose.get('y'))
             except Exception:
                 continue
+            wx, wy = self.__cell_to_world(cx, cy)
             if _distance(wx, wy, px, py) <= self.__robot_avoidance_radius:
                 return True
         return False
 
-    def __astar_path(self, sx: float, sy: float, gx: float, gy: float) -> list[tuple[float, float]]:
+    def __astar_path(self, sx: float, sy: float, gx: float, gy: float, static_only: bool = False) -> list[tuple[float, float]]:
         start = self.__world_to_cell(sx, sy)
         goal = self.__world_to_cell(gx, gy)
         if start == goal:
             return [(gx, gy)]
+
+        blocked = self.__cell_is_blocked_static if static_only else self.__cell_is_blocked
 
         open_heap: list[tuple[float, int, int]] = []
         heapq.heappush(open_heap, (0.0, start[0], start[1]))
@@ -384,7 +430,7 @@ class CbbaAgent(Node):
             for dx, dy in neighbors:
                 nx, ny = cx + dx, cy + dy
                 neighbor = (nx, ny)
-                if self.__cell_is_blocked(nx, ny, start, goal):
+                if blocked(nx, ny, start, goal):
                     continue
                 tentative_g = gscore.get(current, float('inf')) + (math.sqrt(2) if dx != 0 and dy != 0 else 1.0)
                 if tentative_g < gscore.get(neighbor, float('inf')):
@@ -411,7 +457,7 @@ class CbbaAgent(Node):
         if cache_key in self.__path_length_cache:
             return self.__path_length_cache[cache_key]
 
-        path = self.__astar_path(sx, sy, gx, gy)
+        path = self.__astar_path(sx, sy, gx, gy, static_only=True)
 
         # Sum Euclidean distances between consecutive waypoints.
         length = 0.0
@@ -420,15 +466,31 @@ class CbbaAgent(Node):
             length += _distance(prev[0], prev[1], wp[0], wp[1])
             prev = wp
 
+        euclidean = _distance(sx, sy, gx, gy)
+        is_fallback = len(path) == 1 and path[0] == (gx, gy)
+        penalised = False
+
         # If A* only returned the goal (fallback), use straight-line distance
         # but apply a large penalty so robots behind walls bid less.
-        if len(path) == 1 and path[0] == (gx, gy):
-            euclidean = _distance(sx, sy, gx, gy)
+        if is_fallback:
             if length > euclidean * 1.05:
-                pass  # genuine detour path
+                pass  # genuine detour path (shouldn't happen with fallback, but be safe)
             else:
                 # Fallback: penalise heavily to discourage the blocked robot
                 length = euclidean * 3.0
+                penalised = True
+
+        self.get_logger().debug(
+            f'[A*] ({sx:.2f},{sy:.2f})->({gx:.2f},{gy:.2f}): '
+            f'eucl={euclidean:.3f} astar={length:.3f} '
+            f'waypoints={len(path)} fallback={is_fallback} penalised={penalised}'
+        )
+        if penalised:
+            self.get_logger().warn(
+                f'[A* PENALTY] {self.__robot_name}: no path found from '
+                f'({sx:.2f},{sy:.2f}) to ({gx:.2f},{gy:.2f}) — '
+                f'applying x3 penalty (eucl={euclidean:.3f} -> cost={length:.3f})'
+            )
 
         self.__path_length_cache[cache_key] = length
         return length
@@ -439,6 +501,8 @@ class CbbaAgent(Node):
         # Clear the path-length cache at the start of each rebuild so costs
         # reflect the current world state (completed tasks, peer positions).
         self.__path_length_cache.clear()
+
+        bundle_before = list(self.__bundle)
 
         for task_id in list(self.__bundle):
             winner = self.__winner_table.get(task_id)
@@ -470,7 +534,7 @@ class CbbaAgent(Node):
                     selected_score = score
                     selected_task = task
 
-            if selected_task is None or selected_score <= 0.0:
+            if selected_task is None:
                 break
 
             self.__bundle.append(selected_task.task_id)
@@ -478,14 +542,36 @@ class CbbaAgent(Node):
             current_x = selected_task.x
             current_y = selected_task.y
 
-    def __score_for_task(self, task: Task, from_x: float, from_y: float) -> float:
-        """Score using the A* path length as travel cost instead of Euclidean distance.
+        if self.__bundle != bundle_before:
+            # Log the full bundle with per-task travel cost + score breakdown.
+            cx, cy, _ = self.__pose
+            parts = []
+            for tid in self.__bundle:
+                t = self.__task_by_id(tid)
+                cost = self.__astar_path_length(cx, cy, t.x, t.y)
+                score = t.reward - self.__distance_weight * cost
+                penalised = ''
+                # Re-detect fallback to flag it in the log.
+                raw_path = self.__astar_path(cx, cy, t.x, t.y, static_only=True)
+                eucl = _distance(cx, cy, t.x, t.y)
+                if len(raw_path) == 1 and raw_path[0] == (t.x, t.y) and cost >= eucl * 2.9:
+                    penalised = ' [PENALISED]'
+                parts.append('%s(cost=%.2f score=%.2f%s)' % (tid, cost, score, penalised))
+                cx, cy = t.x, t.y
+            self.get_logger().info(
+                '[BUNDLE] %s: %s' % (self.__robot_name, ' -> '.join(parts) if parts else '(empty)')
+            )
 
-        This makes robots behind walls bid lower than robots with a clear path,
-        so tasks are assigned to whichever robot can actually reach them faster.
+    def __score_for_task(self, task: Task, from_x: float, from_y: float) -> float:
+        """Score = reward - distance_weight * A*_travel_cost.
+
+        distance_weight > 1 makes proximity dominate over reward differences,
+        ensuring the closest robot wins even when rewards vary significantly.
+        Default is 5.0 so a 1m difference in path length outweighs a 2-point
+        reward difference on the typical arena scale.
         """
         travel_cost = self.__astar_path_length(from_x, from_y, task.x, task.y)
-        return task.reward - travel_cost
+        return task.reward - self.__distance_weight * travel_cost
 
     def __task_by_id(self, task_id: str) -> Task:
         for task in self.__tasks:
