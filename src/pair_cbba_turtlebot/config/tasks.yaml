@@ -1,0 +1,25 @@
+robot_count: 2
+bundle_size: 1
+arena_radius: 1.8
+arena_wall_thickness: 0.08
+tasks:
+  - id: inspect_a
+    x: 0.85
+    y: 0.35
+    reward: 8.0
+  - id: inspect_b
+    x: -0.70
+    y: 0.40
+    reward: 7.5
+  - id: inspect_c
+    x: 0.25
+    y: -0.85
+    reward: 7.0
+  - id: inspect_d
+    x: -0.95
+    y: -0.15
+    reward: 9.0
+  - id: inspect_e
+    x: 0.65
+    y: -0.70
+    reward: 8.5
