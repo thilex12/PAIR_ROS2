@@ -10,6 +10,14 @@ This workspace contains the ROS2 package `pair` with a lightweight CBBA-style ag
 - Extensible task support through Python plugins
 - A packaged default config and launch file
 
+## Pre-requisites
+
+In order to use this project, first follow the WSL installation on your WSL :
+https://docs.ros.org/en/kilted/Installation/Ubuntu-Install-Debs.html
+Ans then : https://docs.ros.org/en/kilted/Tutorials/Advanced/Simulators/Webots/Installation-Windows.html
+(you can add source /opt/ros/kilted/setup.bash to your bashrc)
+
+
 ## Run
 
 From the workspace root:
