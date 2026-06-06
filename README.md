@@ -17,8 +17,43 @@ https://docs.ros.org/en/kilted/Installation/Ubuntu-Install-Debs.html
 Ans then : https://docs.ros.org/en/kilted/Tutorials/Advanced/Simulators/Webots/Installation-Windows.html
 (you can add source /opt/ros/kilted/setup.bash to your bashrc)
 
+You also may need to download Webot if your wsl don't do it automatically
+
+
+## Configuration
+
+- In src\my_package\config\robots.yaml, you can configure the number of robots, arena size, and the walls
+- In src\my_package\config\cbba_tasks.yaml, you can configure bundle size and taks
 
 ## Run
+
+for the cbba working, you can do on your wsl ubuntu : 
+
+```bash
+colcon build --packages-select my_package --symlink-install && source install/local_setup.bash
+ros2 launch my_package cbba_launch.py
+```
+
+While it's runnin, on another wsl ubuntu, you can check topics where robots are communicating
+
+```bash
+ros2 topic echo cbba/state
+```
+
+Or run rqt_graph to see relations between topics and nodes 
+
+```bash
+ros2 run rqt_graph rqt_graph
+```
+
+
+
+
+---
+
+
+More information
+
 
 From the workspace root:
 
@@ -142,13 +177,3 @@ Tasks are received as a JSON array of objects. A minimal task looks like this:
 ```
 
 The node publishes local bids and allocations as JSON objects on the configured topics.
-
-Build et sourcing
-```bash
-colcon build --packages-select my_package --symlink-install && source install/local_setup.bash
-```
-
-Lancement
-```bash
-ros2 launch my_package cbba_launch.py
-```
